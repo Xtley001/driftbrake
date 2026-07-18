@@ -1,0 +1,36 @@
+[package]
+name = "toy-arbitrage"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal 2-pool arbitrage strategy wired end-to-end through driftbrake, against a public testnet fork. Illustrative, not production-hardened — see SECURITY.md."
+
+[lib]
+name = "toy_arbitrage"
+path = "src/lib.rs"
+
+[[bin]]
+name = "toy-arbitrage"
+path = "src/main.rs"
+
+[dependencies]
+driftbrake-core = { path = "../../core" }
+driftbrake-revm-backend = { path = "../../revm-backend" }
+driftbrake-reconcile = { path = "../../reconcile" }
+driftbrake-receipt-poller = { path = "../../receipt-poller" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+async-trait = "0.1"
+thiserror = "1"
+
+# JSON-RPC + signing for the live-network path (RpcDbFactory,
+# RpcReceiptSource, RpcTxSubmitter in src/rpc.rs). See README.md's
+# "Known limitations" — these are exercised via unit tests against a
+# canned JSON-RPC response; round-tripping against a live archive
+# endpoint has not been independently confirmed.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+serde = { version = "=1.0.210", features = ["derive"] }
+serde_json = "1"
+k256 = { version = "=0.13.4", features = ["ecdsa"] }
+url = "=2.4.1"
+revm = { version = "=3.5.0", default-features = false, features = ["std"] }

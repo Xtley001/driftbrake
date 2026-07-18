@@ -1,0 +1,8 @@
+/target
+/book
+
+# Anyone running examples/toy-arbitrage locally copies .env.example to
+# .env and puts a real private key in it — never commit that.
+.env
+*.env
+!.env.example

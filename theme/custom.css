@@ -1,0 +1,131 @@
+/* Minimalist "terminal / block explorer" theme layered on mdBook's
+ * built-in "navy" theme. No gradients, no shadows, no decoration —
+ * monospace headings, a single accent color, hairline borders. */
+
+:root {
+    --db-accent: #3ddc84;      /* terminal green */
+    --db-accent-dim: #245c3f;
+    --db-bg: #0d1117;
+    --db-bg-alt: #10151c;
+    --db-border: #1f2933;
+    --db-text: #c9d1d9;
+    --db-text-dim: #6e7681;
+}
+
+.navy {
+    --bg: var(--db-bg);
+    --fg: var(--db-text);
+    --sidebar-bg: var(--db-bg-alt);
+    --sidebar-fg: var(--db-text-dim);
+    --sidebar-active: var(--db-accent);
+    --links: var(--db-accent);
+    --inline-code-color: var(--db-accent);
+    --theme-popup-bg: var(--db-bg-alt);
+    --theme-popup-border: var(--db-border);
+    --quote-bg: var(--db-bg-alt);
+    --quote-border: var(--db-accent-dim);
+    --table-border-color: var(--db-border);
+    --table-header-bg: var(--db-bg-alt);
+    --table-alternate-bg: var(--db-bg-alt);
+}
+
+body {
+    font-family: "Söhne", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    letter-spacing: 0.005em;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    border-bottom: 1px solid var(--db-border);
+    padding-bottom: 0.3em;
+}
+
+h1 {
+    text-transform: lowercase;
+}
+
+h1::before {
+    content: "// ";
+    color: var(--db-text-dim);
+    font-weight: 400;
+}
+
+code, pre, pre code {
+    font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85em;
+}
+
+pre {
+    background: var(--db-bg-alt) !important;
+    border: 1px solid var(--db-border);
+    border-radius: 2px;
+    box-shadow: none !important;
+}
+
+:not(pre) > code {
+    background: var(--db-bg-alt);
+    border: 1px solid var(--db-border);
+    border-radius: 2px;
+    padding: 0.1em 0.35em;
+}
+
+a {
+    text-decoration: none;
+    border-bottom: 1px solid var(--db-accent-dim);
+    transition: border-color 0.15s ease;
+}
+
+a:hover {
+    border-bottom-color: var(--db-accent);
+}
+
+table {
+    border-collapse: collapse;
+    border: 1px solid var(--db-border);
+}
+
+th, td {
+    border: 1px solid var(--db-border);
+    padding: 0.5em 0.8em;
+}
+
+th {
+    font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.78em;
+    letter-spacing: 0.06em;
+    color: var(--db-text-dim);
+}
+
+blockquote {
+    border-left: 2px solid var(--db-accent-dim);
+    background: var(--db-bg-alt);
+    border-radius: 0;
+    padding: 0.6em 1em;
+}
+
+.sidebar {
+    border-right: 1px solid var(--db-border);
+}
+
+.chapter li.chapter-item {
+    font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+    font-size: 0.88em;
+}
+
+.menu-title {
+    font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+    letter-spacing: 0.02em;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid var(--db-border);
+}
+
+::selection {
+    background: var(--db-accent-dim);
+}

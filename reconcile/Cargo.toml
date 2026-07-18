@@ -1,0 +1,13 @@
+[package]
+name = "driftbrake-reconcile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "The default HaltPolicy: the dual-guard reconciliation mechanism ('phantom-guard') — fast guard + slow guard. See docs/whitepaper.md."
+keywords = ["ethereum", "trading", "risk-management", "mev", "simulation"]
+
+[dependencies]
+driftbrake-core = { path = "../core", version = "0.1.0" }

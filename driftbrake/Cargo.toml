@@ -1,0 +1,25 @@
+[package]
+name = "driftbrake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "../README.md"
+description = "Chain-agnostic pre-flight simulation + drift-based halt guard for simulation-driven trading strategies. Re-exports core, reconcile, and receipt-poller as a single dependency. The REVM simulation backend (driftbrake-revm-backend) is a separate, opt-in crate, not bundled here — see docs/ARCHITECTURE.md's 'swappable simulation backend' goal: a team using their own simulation stack should not be forced to compile REVM just to depend on driftbrake."
+keywords = ["ethereum", "evm", "mev", "trading", "risk-management"]
+
+[dependencies]
+driftbrake-core = { path = "../core", version = "0.1.0" }
+driftbrake-reconcile = { path = "../reconcile", version = "0.1.0" }
+driftbrake-receipt-poller = { path = "../receipt-poller", version = "0.1.0" }
+
+[dev-dependencies]
+# Dev-only, for the Quickstart doctest in src/lib.rs, which demonstrates
+# wiring driftbrake together with the REVM backend — mirrors what a real
+# user adds as a *separate* `cargo add driftbrake-revm-backend`.
+driftbrake-revm-backend = { path = "../revm-backend", version = "0.1.0" }
+revm = { version = "=3.5.0", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"

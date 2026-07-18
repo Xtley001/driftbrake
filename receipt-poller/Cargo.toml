@@ -1,0 +1,19 @@
+[package]
+name = "driftbrake-receipt-poller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Confirms receipts and books realized profit via RealizedProfitDecoder, gated on both confirmed status and a decodable profit event. Polling interval/timeout are a function of block time, not a fixed constant."
+keywords = ["ethereum", "evm", "mev", "async", "trading"]
+
+[dependencies]
+driftbrake-core = { path = "../core", version = "0.1.0" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["time", "rt"] }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "rt", "macros", "rt-multi-thread", "test-util", "sync"] }

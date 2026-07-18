@@ -1,0 +1,29 @@
+[package]
+name = "driftbrake-revm-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Concrete SimEngine implementation: REVM fork-and-simulate, spawn_blocking, bounded concurrency, block-time-relative timeout. See docs/ARCHITECTURE.md."
+keywords = ["ethereum", "evm", "revm", "simulation", "mev"]
+
+[dependencies]
+driftbrake-core = { path = "../core", version = "0.1.0" }
+revm = { version = "=3.5.0", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "1"
+base64ct = "=1.6.0"
+home = "=0.5.9"
+ruint = "=1.12.3"
+zeroize = "=1.7.0"
+zeroize_derive = "=1.4.2"
+toml_parser = "=1.0.2"
+indexmap = "=2.6.0"
+serde = "=1.0.210"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }

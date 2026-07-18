@@ -1,0 +1,22 @@
+[package]
+name = "driftbrake-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Threshold-selection methodology from docs/BENCHMARK.md: synthetic (predicted, realized) pair generation under healthy/drifted regimes, a parameter sweep over (T_f, k_f, T_s, k_s), and the resulting false-halt-rate / missed-catch-rate curve."
+keywords = ["ethereum", "benchmark", "simulation", "trading", "risk-management"]
+
+[lib]
+name = "driftbrake_benchmark"
+path = "src/lib.rs"
+
+[[bin]]
+name = "driftbrake-benchmark"
+path = "src/main.rs"
+
+[dependencies]
+driftbrake-core = { path = "../core", version = "0.1.0" }
+driftbrake-reconcile = { path = "../reconcile", version = "0.1.0" }

@@ -1,0 +1,16 @@
+[toolchain]
+# Pins a recent stable channel. `revm`, `ureq`, and `url`'s current
+# releases require edition2024 (stabilized in Rust 1.85) via transitive
+# dependencies, so anything older than that will fail to build a handful
+# of crates in this workspace.
+#
+# Before CI or a contributor relies on this: replace "stable" with a
+# specific pinned version (e.g. "1.85.0") matching what CI actually
+# runs, and remove the explicit "=x.y.z" version pins in
+# `revm-backend/Cargo.toml`, `driftbrake/Cargo.toml`, and
+# `examples/toy-arbitrage/Cargo.toml` — those route around an older,
+# network-restricted build environment used during initial development
+# and are not a deliberate compatibility decision. See
+# `CONTRIBUTING.md`'s "Development setup" section.
+channel = "stable"
+components = ["rustfmt", "clippy"]

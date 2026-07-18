@@ -1,0 +1,22 @@
+[book]
+title = "driftbrake"
+description = "Chain-agnostic pre-flight simulation + drift-based halt guard for simulation-driven trading strategies."
+authors = ["Xtley001"]
+src = "docs"
+language = "en"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/Xtley001/driftbrake"
+edit-url-template = "https://github.com/Xtley001/driftbrake/edit/main/docs/{path}"
+additional-css = ["theme/custom.css"]
+no-section-label = true
+mathjax-support = true
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.playground]
+runnable = false
