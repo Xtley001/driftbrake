@@ -3,8 +3,6 @@
 **Date:** 2026-07-13
 **Author(s):** Driftbrake project
 
-> **Note on math rendering.** This document uses LaTeX-style notation (`$...$` inline, `$$...$$` display). GitHub does not render LaTeX natively in plain `.md`. If you are reading this on GitHub, formulas will appear as raw source; a rendered version is planned for the project's docs site (KaTeX-enabled). All formulas are also given in plain-language and code form so the document remains usable without LaTeX rendering.
-
 ## Abstract
 
 Automated trading strategies that submit transactions based on an internal simulation — a REVM fork, a price model, an assumption about fill order — face a structural risk distinct from strategy failure: the simulation itself can drift from actual chain state, causing the strategy to keep submitting transactions that are confidently wrong, either reverting outright or succeeding for materially less profit than predicted. Because each individual transaction can look unremarkable in isolation, this drift is difficult to detect from log inspection alone and can silently erode capital over many trades. This document specifies Driftbrake's reconciliation mechanism: a pair of independent statistical guards that monitor the *relationship* between predicted and realized profit across a transaction history, rather than any single transaction's outcome, and halt the strategy when that relationship degrades beyond a configurable threshold. We state the mechanism's formal properties, including a correctness argument for the ratio-direction computation that a naive implementation is prone to inverting, and describe a benchmark methodology for selecting and validating guard thresholds against a given chain's volatility profile.
