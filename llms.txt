@@ -17,7 +17,7 @@ driftbrake is a modular Rust library that pre-flight simulates transactions (e.g
   - `driftbrake-journal`: Crash-resilient binary Write-Ahead Log (WAL) disk persistence for `ReconcileHistory` with CRC32 integrity verification.
   - `driftbrake-receipt-poller`: Block-time-aware transaction receipt confirmation and profit decoding.
   - `driftbrake-revm-backend`: REVM fork-and-simulate engine with thread-safe `spawn_blocking` and bounded RPC concurrency.
-  - `driftbrake-py`: Official Python native extension (`pip install driftbrake`) with PyO3 bindings and vectorized backtesting sweeps.
+  - `driftbrake-py`: Official Python native extension (`pip install driftbrake-py`) with PyO3 bindings and vectorized backtesting sweeps.
   - `driftbrake-benchmark`: Synthetic simulation drift generator and false-halt vs missed-catch benchmark sweep.
 
 ## Core Concepts & Problem Solved
@@ -44,7 +44,7 @@ driftbrake-revm-backend = "0.2"
 
 ```bash
 # Python (pip)
-pip install driftbrake
+pip install driftbrake-py
 ```
 
 ## Minimal Example (Rust)
@@ -95,4 +95,4 @@ if decision.is_halted:
 - [Architecture Deep Dive](https://xtley001.github.io/driftbrake/ARCHITECTURE.html)
 - [API Reference](https://docs.rs/driftbrake)
 - [Crates.io Package](https://crates.io/crates/driftbrake)
-- [PyPI Package](https://pypi.org/project/driftbrake/)
+- [PyPI Package](https://pypi.org/project/driftbrake-py/)

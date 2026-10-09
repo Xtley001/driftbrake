@@ -3,7 +3,7 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "driftbrake"
+name = "driftbrake-py"
 version = "0.2.0"
 description = "Chain-agnostic pre-flight simulation and drift-based halt guard for simulation-driven trading strategies and MEV searchers."
 readme = "README.md"

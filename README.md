@@ -5,7 +5,7 @@ A chain-agnostic simulation and drift-based halt guard for algorithmic trading s
 [![CI](https://github.com/Xtley001/driftbrake/actions/workflows/ci.yml/badge.svg)](https://github.com/Xtley001/driftbrake/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![crates.io](https://img.shields.io/crates/v/driftbrake)](https://crates.io/crates/driftbrake)
-[![PyPI](https://img.shields.io/pypi/v/driftbrake)](https://pypi.org/project/driftbrake/)
+[![PyPI](https://img.shields.io/pypi/v/driftbrake-py)](https://pypi.org/project/driftbrake-py/)
 [![docs.rs](https://img.shields.io/docsrs/driftbrake)](https://docs.rs/driftbrake)
 [![book](https://img.shields.io/badge/book-design%20docs-3ddc84)](https://xtley001.github.io/driftbrake/)
 
@@ -22,7 +22,7 @@ cargo add driftbrake-revm-backend
 
 ### Python
 ```bash
-pip install driftbrake
+pip install driftbrake-py
 ```
 
 ## Quickstart

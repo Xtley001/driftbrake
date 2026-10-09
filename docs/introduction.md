@@ -18,7 +18,7 @@ This book documents the design, mathematical invariants, and architectural bound
 |---|---|
 | **Source Repository** | [github.com/Xtley001/driftbrake](https://github.com/Xtley001/driftbrake) |
 | **Rust Package** | [crates.io/crates/driftbrake](https://crates.io/crates/driftbrake) |
-| **Python Package** | [pypi.org/project/driftbrake](https://pypi.org/project/driftbrake/) |
+| **Python Package** | [pypi.org/project/driftbrake-py](https://pypi.org/project/driftbrake-py/) |
 | **API Reference** | [docs.rs/driftbrake](https://docs.rs/driftbrake) |
 
 ## Navigation
