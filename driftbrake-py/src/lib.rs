@@ -27,6 +27,16 @@ pub struct PyHaltDecision {
 #[pymethods]
 impl PyHaltDecision {
     #[getter]
+    fn is_halted(&self) -> bool {
+        self.should_halt
+    }
+
+    #[getter]
+    fn reason(&self) -> Option<String> {
+        self.reason_name.clone()
+    }
+
+    #[getter]
     fn details<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         if let HaltDecision::Halt(ref reason) = self.decision {
@@ -204,6 +214,50 @@ pub struct PyReconcilePolicy {
 
 #[pymethods]
 impl PyReconcilePolicy {
+    /// Constructs a ReconcilePolicy with customizable guards and thresholds.
+    #[new]
+    #[pyo3(signature = (
+        fast_threshold=0.50,
+        fast_window=3,
+        slow_threshold=0.70,
+        slow_window=20,
+        revert_burst_limit=None,
+        volume_weighted_threshold=None,
+        volume_weighted_window=20,
+        revert_gas_budget=None,
+        revert_gas_window=10,
+        drawdown_limit=None,
+        drawdown_window=20
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        fast_threshold: f64,
+        fast_window: usize,
+        slow_threshold: f64,
+        slow_window: usize,
+        revert_burst_limit: Option<usize>,
+        volume_weighted_threshold: Option<f64>,
+        volume_weighted_window: usize,
+        revert_gas_budget: Option<u128>,
+        revert_gas_window: usize,
+        drawdown_limit: Option<i128>,
+        drawdown_window: usize,
+    ) -> Self {
+        Self::institutional(
+            fast_threshold,
+            fast_window,
+            slow_threshold,
+            slow_window,
+            revert_burst_limit,
+            volume_weighted_threshold,
+            volume_weighted_window,
+            revert_gas_budget,
+            revert_gas_window,
+            drawdown_limit,
+            drawdown_window,
+        )
+    }
+
     /// Creates the default dual-guard policy (Fast: 3 @ 0.50, Slow: 20 @ 0.70).
     #[staticmethod]
     fn default_dual_guard() -> Self {
