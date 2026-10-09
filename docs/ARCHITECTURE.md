@@ -1,142 +1,132 @@
 # Architecture
 
-This document describes how `driftbrake` is put together internally: the module boundaries, the trait contracts that make it chain- and strategy-agnostic, and the reasoning behind the parts of the design that aren't obvious from reading the code alone. For the argument that the design is *correct* (invariants, formal properties, the ratio-direction proof), see [`whitepaper.md`](./whitepaper.md). This document is about *shape*, not proof.
+This document describes the architectural structure of `driftbrake`: module boundaries, trait contracts, non-blocking asynchronous concurrency, state persistence, and Python bindings. For formal invariant proofs and mathematical derivations, see the [whitepaper](./whitepaper.md).
 
-## Design goals, in priority order
+## Design Goals
 
-1. **Chain-agnostic.** Nothing in `core` assumes a specific block time, EVM spec version, or ABI shape.
-2. **Strategy-agnostic.** Nothing in `core` assumes a specific profit-decoding shape, venue, or strategy structure.
-3. **Small surface, hard boundary.** `driftbrake` does exactly one thing — pre-flight simulation plus drift-based halting. Alerting, nonce isolation, and USD-denominated gas budgets are explicitly out of scope (see [Non-goals](#non-goals)).
-4. **Swappable simulation backend.** A team with an existing simulation stack should be able to keep it and still get the reconciliation and halt logic for free.
+1. **Chain-Agnostic**: Core trait boundaries impose zero assumptions regarding block time, consensus mechanisms, EVM version, or ABI encodings.
+2. **Strategy-Agnostic**: Decouples profit decoding from specific contract layouts, decentralized exchange routers, or liquidation venues.
+3. **Focused Scope**: Encapsulates simulation pre-flight, reconciliation, and halting. Alerting integrations, wallet management, and price oracles are deliberately excluded (see [Non-goals](#non-goals)).
+4. **Swappable Backends**: SimEngine is a pluggable trait. Teams with proprietary simulation infrastructure can integrate their custom backends while utilizing Driftbrake's reconciliation engine.
+5. **Crash Resilience**: State is persisted to a Write-Ahead Log (WAL) to ensure continuous risk enforcement across bot restarts.
 
-## Module map
+## Module Map
 
 ```
 driftbrake/
-├── core/                  # chain-agnostic traits, zero REVM/alloy dependency
-│   ├── ProfitDecoder
-│   ├── RealizedProfitDecoder
-│   └── HaltPolicy
-├── revm-backend/          # concrete implementation of SimEngine
-│   ├── fork-and-simulate, spawn_blocking wrapper, bounded concurrency
-│   └── configurable: timeout-as-fraction-of-block-time, concurrency cap
-├── reconcile/             # the halt-guard logic (carries the "phantom-guard" name, see Naming)
-│   ├── default HaltPolicy: fast guard (3-consecutive) + rolling guard (window N, threshold T)
-│   └── both guards configurable, not hardcoded at 0.50 / 0.70 / 3 / 20
-├── receipt-poller/        # confirms receipts, generalized polling interval/timeout
-├── telemetry/             # structured events for the benchmark harness to consume
+├── core/                  # Chain-agnostic traits, zero REVM/alloy dependencies
+│   ├── ProfitDecoder / RealizedProfitDecoder
+│   ├── HaltPolicy / HaltDecision / HaltReason
+│   └── RevertEvent / HistoryEntry
+├── reconcile/             # Multi-guard HaltPolicy implementation
+│   ├── Fast guard (consecutive acute drops)
+│   ├── Slow guard (rolling mean drift)
+│   ├── Revert-Burst & Gas budget guards
+│   ├── Volume-Weighted drift guard (VWAR)
+│   └── Net capital drawdown guard
+├── journal/               # Crash-resilient binary Write-Ahead Log (WAL) with CRC32
+├── receipt-poller/        # Receipt polling and profit realization gating
+├── revm-backend/          # Concrete SimEngine implementation (in-process REVM forks)
+├── driftbrake-py/         # Python bindings (PyO3, Stable ABI3, vectorized parameter sweeps)
+├── benchmark/             # Threshold calibration harness and CLI
 └── examples/
-    └── toy-arbitrage/     # minimal 2-pool arb wired end-to-end against a public testnet fork
+    └── toy-arbitrage/     # Minimal 2-pool arbitrage strategy wired end-to-end
 ```
 
-`core` has zero dependency on REVM or `alloy` types. `RawSimOutput` and `ReconcileHistory` are plain, serialization-friendly data (`serde`-derivable structs and enums, no RPC client types, no REVM database handles). This is the boundary that makes `revm-backend` swappable rather than load-bearing: a team using a different simulation stack implements `SimEngine` against their own tooling and keeps `reconcile` and `receipt-poller` unchanged.
+## Core Trait Boundaries
 
-## `core`: the trait boundaries
-
-These three traits are the actual generalization layer — the part that doesn't already exist elsewhere as a packaged abstraction.
+The generalization layer resides in `driftbrake-core`, which maintains zero dependencies on REVM or RPC clients.
 
 ### `ProfitDecoder`
 
+Decodes raw simulation execution traces into a strategy-denominated predicted profit figure:
+
 ```rust
 pub trait ProfitDecoder: Send + Sync {
-    /// Decode a raw REVM execution trace/return value into a predicted profit,
-    /// in the smallest denominated unit (e.g. wei).
+    /// Decode a raw execution trace or return value into predicted profit (e.g. wei).
     fn decode_predicted(&self, raw: &RawSimOutput) -> Result<PredictedProfit, DecodeError>;
 }
 ```
 
-Replaces what was originally a hardcoded `simulate()` call returning a single `uint256`. Any executor contract shape — single-call, multicall, flash-loan-wrapped — implements this trait once and plugs into the rest of the pipeline unchanged.
+Implementations must be pure and synchronous. Network I/O during decoding is prohibited.
 
 ### `RealizedProfitDecoder`
 
+Extracts realized profit from confirmed receipts and transaction logs, net of gas expenses:
+
 ```rust
 pub trait RealizedProfitDecoder: Send + Sync {
-    /// Decode a confirmed receipt + its logs into a realized profit,
-    /// net of gas cost, in the same unit as PredictedProfit.
+    /// Decode a confirmed receipt and its logs into realized profit, net of gas cost.
     fn decode_realized(&self, receipt: &TxReceipt, logs: &[Log]) -> Result<RealizedProfit, DecodeError>;
 }
 ```
 
-Replaces a hardcoded `Profit` event ABI. `receipt-poller` calls this once a receipt reaches confirmed status; it nets `gas_used × effective_gas_price` from whatever profit figure the implementation extracts.
+Receipt status must be confirmed. Reverted transactions are handled separately and never passed to `decode_realized`.
 
 ### `HaltPolicy`
 
+Evaluates accumulated history to determine whether strategy execution remains safe:
+
 ```rust
 pub trait HaltPolicy: Send + Sync {
-    /// Given the full (sim, realized) history so far, decide whether to halt.
+    /// Evaluate the full reconciliation history and return a halt decision.
     fn evaluate(&mut self, history: &ReconcileHistory) -> HaltDecision;
 }
 ```
 
-Replaces hardcoded fast/slow guard constants. The default `HaltPolicy` implementation is the dual guard described below, but it is a default, not the only option — a team can implement their own `HaltPolicy` entirely (e.g. a Bayesian change-point detector) and keep everything else in the pipeline.
+The default institutional implementation is provided by `driftbrake-reconcile`.
 
-Why these three and not more: everything else in the pipeline (forking state, submitting transactions, polling for receipts) is mechanical I/O that doesn't vary across strategies once you fix a chain. These three are the places where strategy-specific and chain-specific knowledge actually has to enter the system, so they're the only three traits — resist the temptation to add more surface area than this.
+## Simulation Backend (`driftbrake-revm-backend`)
 
-## `revm-backend`: `SimEngine`
+`SimEngine` executes candidate transactions against local state forks. Three implementation patterns are critical for production stability:
 
-`SimEngine` forks chain state at the current block, runs the candidate transaction through REVM in-process, and returns a `RawSimOutput` (profit, gas, revert reason if any) within a hard latency budget.
+### 1. `spawn_blocking` Isolation
+Simulating transactions in REVM is CPU-bound synchronous work. Executing simulations directly inside an async task starves Tokio worker threads, delaying mempool ingestion and block-processing routines. `RevmBackend` executes simulations within `tokio::task::spawn_blocking` thread pools, preserving async runtime responsiveness.
 
-Three implementation details are load-bearing and are called out explicitly because a naive reimplementation gets them wrong:
+### 2. Bounded RPC Concurrency
+Simulating multiple candidate transactions per block can saturate RPC rate limits if executed concurrently via unbounded joins. `RevmBackend` enforces a concurrency semaphore bounded by provider capacity (e.g. `buffer_unordered(N)`).
 
-### 1. `spawn_blocking` for REVM/RPC calls
+### 3. Block-Time Relative Timeouts
+Fixed timeouts fail across diverse networks (e.g. 400ms on Arbitrum vs. 12s on Ethereum mainnet). `RevmBackend` calculates simulation timeouts dynamically as a configurable fraction of target block time.
 
-REVM execution and synchronous RPC calls are CPU/IO-blocking work. Running them directly inside an `async fn` on a tokio runtime blocks whichever worker thread picked up that task — and because tokio multiplexes many tasks per worker thread, this doesn't just slow the one simulation, it starves the main block-processing loop and every other concurrent task sharing that thread pool. The fix is to wrap every REVM/RPC call in `tokio::task::spawn_blocking`, which moves the work to a dedicated blocking-thread pool and leaves the async worker threads free.
+## Multi-Guard Reconciliation (`driftbrake-reconcile`)
 
-This is not a chain-specific quirk. It reproduces identically on a 400ms-block chain and a 12-second-block chain, because the bug is about thread-pool starvation, not timing.
+`driftbrake-reconcile` implements an institutional multi-guard hierarchy evaluated on every new history entry:
 
-### 2. Bounded concurrency for RPC calls
+| Guard | Trigger Condition | Operational Role |
+|---|---|---|
+| **Revert-Burst** | $N$ consecutive on-chain reverts | Halts on competitive front-running or stale state |
+| **Revert-Gas Budget** | Cumulative revert gas exceeds budget | Caps unproductive gas burn |
+| **Fast Guard** | $k_f$ consecutive ratios $< T_f$ | Detects sudden market dislocations or broken price feeds |
+| **Slow Guard** | Rolling mean ratio $< T_s$ | Detects subtle, compounding drift bleed |
+| **Volume-Weighted** | VWAR across window $< T_v$ | Prevents large trade miscalculations masked by small trades |
+| **Net Drawdown** | Realized profit drops $> D_{\text{max}}$ from peak | Protects accumulated portfolio capital |
 
-A block can surface 50+ candidate opportunities that all need simulating. Firing all of them concurrently via `futures::future::join_all` saturates the RPC provider's rate limit — turning what should be a fast local simulation into a slow, rate-limited one exactly when speed matters most (i.e., during the highest-opportunity blocks). The fix is bounding concurrency to `N`, tied to the RPC provider's actual rate limit, not a magic number picked once and forgotten — whether that's a caller-side `buffer_unordered(N)` or, as `revm-backend`'s `RevmBackend` does, a semaphore held internally by the engine itself (a stronger form of the same guarantee: the bound holds regardless of how a caller fans out its calls).
+### Ratio Direction Invariant
+Ratios are computed strictly as $\text{realized} / \text{predicted}$. Computing the inverse $\text{predicted} / \text{realized}$ maps underperformance to values $> 1.0$, which causes guards to flag harmless overperformance while ignoring severe capital losses. This invariant is enforced through regression tests.
 
-### 3. Timeout as a fraction of block time, not a fixed constant
+## State Persistence (`driftbrake-journal`)
 
-A simulation timeout tuned for a 400ms-block chain is nonsensical on a 12-second-block chain, and vice versa — too tight starves valid simulations on a slow chain, too loose means a bot is still simulating after the block it was targeting has already passed on a fast chain. `revm-backend` takes `block_time_ms` as a required parameter and derives the simulation timeout as a configurable fraction of it (default: a sensible fraction that leaves headroom for submission after simulation completes, made explicit and tunable rather than hidden inside the code).
+In high-frequency environments, process crashes or server restarts must not erase risk state. `driftbrake-journal` provides:
 
-## `reconcile`: the dual halt guard
+- **Append-Only Binary Log**: Low-overhead disk logging for trade pairs and revert events.
+- **Checksum Verification**: Every binary frame includes an IEEE 802.3 CRC32 checksum.
+- **Torn-Write Recovery**: If a crash occurs mid-write, recovery truncates corrupted trailing bytes to the last verified frame.
+- **Single-Writer Lock**: File locking prevents multiple concurrent bot processes from corrupting shared state.
 
-`reconcile` is the module that carries the `phantom-guard` name (see [Naming](#naming)). It implements the default `HaltPolicy`: two independent guards evaluated on every new `(sim, realized)` pair.
+## Python Integration (`driftbrake-py`)
 
-- **Fast guard** — halts immediately on 3 consecutive transactions with `realized / sim < 0.50`.
-- **Slow guard** — halts if the mean ratio over the last 20 `(sim, realized)` pairs drops below 0.70.
+To accommodate quantitative research and offline parameter optimization:
 
-### Why two guards, not one
+- **PyO3 & CPython Stable ABI**: Compiled against `abi3-py310`, ensuring forward compatibility across Python 3.10–3.14+.
+- **Vectorized Sweep Engine**: `run_sweep_raw` evaluates parameter grids over historical datasets in compiled Rust with GIL release, testing millions of combinations per second.
+- **Native Exceptions**: Tripped decisions map directly to `StrategyHaltedError`.
 
-The two guards catch different failure shapes and neither substitutes for the other:
+## Non-Goals
 
-- **Fast guard catches a sudden, severe break** — a venue going down, a price feed going stale all at once. Three bad trades in a row is a strong signal *right now*, and waiting for a 20-trade rolling window to reflect that would let a sudden break run for far too long before it's caught.
-- **Slow guard catches a slow bleed** — small, individually-forgivable underperformance (each trade might be a 0.85 ratio, never bad enough to trip the fast guard's 0.50 threshold) that compounds into real capital loss over a session. A system with only the fast guard is blind to this; a system with only the slow guard reacts too slowly to a sudden break.
+The following features are explicitly out of scope:
 
-Both guards are independently configurable (threshold and window size are parameters, not constants) precisely because the numbers that were empirically tuned for one chain's latency and volatility profile are not assumed to transfer to another chain without re-validation — see the benchmark methodology in [`BENCHMARK.md`](./BENCHMARK.md) for how to re-derive them.
-
-### Why the ratio direction matters
-
-`reconcile` computes `realized / sim`, never `sim / realized`. This looks like it shouldn't matter, but the inverted ratio silently changes which case gets flagged: with `realized / sim`, a value below 1.0 means underperformance (the case you need to catch) and a value above 1.0 means overperformance (harmless). Invert the ratio and a value *above* 1.0 now means underperformance — which either creates false-halt noise on harmless overperformance, or, worse, fails to halt on genuine underperformance because the inverted ratio doesn't cross the configured threshold in the direction the guard is checking. This is treated as a formal invariant, not an implementation detail — see [`whitepaper.md`](./whitepaper.md#formal-properties--invariants) for the labeled statement and the regression test that guards it.
-
-## `receipt-poller`
-
-Polls for confirmed receipts and books profit only once two conditions are both met: confirmed transaction status *and* an emitted profit event decoded via `RealizedProfitDecoder`. Requiring both, rather than either alone, avoids two separate failure modes: a confirmed-but-reverted transaction being miscounted as profit, and a profit-shaped log appearing from an unrelated or simulated context. Gas cost (`gas_used × effective_gas_price`) is available on the `TxReceipt` passed to `RealizedProfitDecoder`, but netting it is the decoder implementation's responsibility, not something `receipt-poller` subtracts automatically — see [`API.md`](./API.md)'s `RealizedProfitDecoder` contract.
-
-Polling interval and timeout are expressed as a function of block time, following the same reasoning as the `SimEngine` timeout: a fixed millisecond value tuned for one chain doesn't transfer to another.
-
-## `telemetry`
-
-Emits structured events (`RawSimOutput`, `ReconcileEvent` — a telemetry-specific summary of one reconciliation step, not a `core` type — and `HaltDecision`) that the benchmark harness consumes to reconstruct the false-halt-rate / missed-catch-rate curve described in [`BENCHMARK.md`](./BENCHMARK.md). Telemetry is a data-emission layer only — it does not implement alerting (Telegram, PagerDuty, etc.), which is explicitly out of scope (see below).
-
-## Extensibility: WASM
-
-Because `core` has zero dependency on REVM or `alloy` types, and `RawSimOutput`/`ReconcileHistory` are plain serializable data, the portable simulation-*logic* layer (decoding, reconciliation, halt evaluation) is a natural target for a WASM build. The fork-and-fetch I/O layer in `revm-backend` inherently depends on a live RPC connection and is not part of this extension — only the logic that consumes already-fetched data is portable. This is a structural property of the current design, not a committed roadmap item; it costs nothing to preserve now and remains available if a future need for it (e.g. a non-Rust host embedding the reconciliation logic) arises.
-
-## Non-goals
-
-Explicitly out of scope for this crate, and not planned for a future version without a deliberate scope decision:
-
-- **Alerting** (Telegram, PagerDuty, or otherwise) — belongs in whatever ops stack a team already runs; `telemetry` emits structured events that any alerting layer can consume, but `driftbrake` does not ship one.
-- **Per-strategy EOA nonce isolation** — a wallet/submission-layer concern, not a simulation/reconciliation concern.
-- **Gas budget in USD** — requires a price oracle and a currency-conversion opinion that doesn't belong in a chain-agnostic crate.
-- **Inventory-aware unwind logic** — deferred. The reference implementation this is extracted from was flash-loan-funded with no inventory to unwind. Adding unwind logic widens the applicable audience to vault/LP strategies, but introduces a genuinely different failure mode (partial fills, slippage on the unwind itself) that deserves its own design pass rather than being bolted onto the halt guard half-finished. This is a documented non-goal for v1, not an oversight.
-
-Keeping this boundary disciplined is a design decision, not an omission: a crate that tries to be a full bot-ops platform forces every adopting team to displace their existing alerting and ops stack, which makes it harder to adopt, not easier. A crate that does exactly one thing well slots into an existing stack without a fight.
-
-## Naming
-
-The `reconcile` module keeps the name **phantom-guard** internally and in documentation, even though the top-level crate is `driftbrake`. "Phantom profit" is an existing, recognizable term of art for the exact failure mode this module addresses (a bot believing it made money it did not actually make), and it's worth preserving as a specific, quotable name for the halt mechanism, distinct from the umbrella project name. The two names are meant to coexist: `driftbrake` is what you depend on; `phantom-guard` is the name people use when discussing the mechanism itself.
+- **Alerting Integrations**: Telegram, Discord, and Slack webhooks belong in external monitoring stacks.
+- **Private Key Custody**: Transaction signing and nonce tracking belong in execution wallets.
+- **Fiat Price Feeds**: USD conversion logic requires external oracles and does not belong in core traits.
+- **Inventory Unwind**: Position unwinding algorithms are specific to portfolio structures and are decoupled from circuit breaking.

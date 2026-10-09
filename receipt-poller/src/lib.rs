@@ -113,6 +113,8 @@ where
                                 tx_hash,
                                 block_number: receipt.block_number,
                                 reason: None,
+                                gas_used: receipt.gas_used,
+                                effective_gas_price: receipt.effective_gas_price,
                             };
                             history.record_revert(event.clone());
                             PollOutcome::Reverted(event)

@@ -1,8 +1,40 @@
+# Build outputs
 /target
 /book
 
-# Anyone running examples/toy-arbitrage locally copies .env.example to
-# .env and puts a real private key in it — never commit that.
+# Development and planning workspace
+/update
+
+# Environment secrets
 .env
 *.env
 !.env.example
+
+# Python compiled binaries & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+*.dylib
+*.dll
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+ENV/
+
+# Temporary WAL and lock files
+*.wal
+*.wal.lock
+
+# OS and Editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.bak

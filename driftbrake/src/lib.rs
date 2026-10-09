@@ -4,10 +4,10 @@
 //! into real capital loss.
 //!
 //! This is a **facade crate**: it re-exports [`driftbrake_core`],
-//! [`driftbrake_reconcile`], and [`driftbrake_receipt_poller`] under one
-//! dependency, so `cargo add driftbrake` gets you the chain-agnostic
-//! traits, the default dual-guard halt policy, and receipt polling in one
-//! shot.
+//! [`driftbrake_reconcile`], [`driftbrake_receipt_poller`], and
+//! [`driftbrake_journal`] under one dependency, so `cargo add driftbrake` gets
+//! you the chain-agnostic traits, the default dual-guard halt policy, receipt
+//! polling, and persistent WAL state in one shot.
 //!
 //! **The REVM simulation backend is intentionally not bundled here.**
 //! `driftbrake-revm-backend` is a separate crate (`cargo add
@@ -109,13 +109,18 @@
 //! ```
 
 pub use driftbrake_core::{
-    DecodeError, HaltDecision, HaltPolicy, HaltReason, Log, PredictedProfit, ProfitDecoder,
+    DecodeError, HaltDecision, HaltPolicy, HaltReason, HistoryEntry, Log, PredictedProfit, ProfitDecoder,
     RawSimOutput, RealizedProfit, RealizedProfitDecoder, ReconcileHistory, RevertEvent, SimEngine,
     SimError, TxReceipt, TxStatus,
 };
 
-pub use driftbrake_reconcile::{FastGuardConfig, ReconcilePolicy, SlowGuardConfig};
+pub use driftbrake_reconcile::{
+    DrawdownConfig, FastGuardConfig, ReconcilePolicy, RevertBurstConfig, RevertGasConfig,
+    SlowGuardConfig, VolumeWeightedConfig,
+};
 
 pub use driftbrake_receipt_poller::{
     PollError, PollOutcome, PollerConfig, ReceiptPoller, ReceiptSource,
 };
+
+pub use driftbrake_journal::{JournalError, JournaledHistory};

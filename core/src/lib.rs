@@ -21,8 +21,8 @@ mod types;
 pub use error::{DecodeError, SimError};
 pub use traits::{HaltPolicy, ProfitDecoder, RealizedProfitDecoder, SimEngine};
 pub use types::{
-    HaltDecision, HaltReason, Log, PredictedProfit, RawSimOutput, RealizedProfit, ReconcileHistory,
-    RevertEvent, TxReceipt, TxStatus,
+    HaltDecision, HaltReason, HistoryEntry, Log, PredictedProfit, RawSimOutput, RealizedProfit,
+    ReconcileHistory, RevertEvent, TxReceipt, TxStatus,
 };
 
 #[cfg(test)]
@@ -101,10 +101,68 @@ mod tests {
             tx_hash: [0u8; 32],
             block_number: 1,
             reason: Some("out of gas".to_string()),
+            gas_used: 21_000,
+            effective_gas_price: 30_000_000_000,
         });
 
         assert_eq!(history.pairs.len(), 1);
         assert_eq!(history.reverts.len(), 1);
+        assert_eq!(history.timeline.len(), 2);
         assert_eq!(history.recent_ratios(10), vec![0.8]);
+    }
+
+    #[test]
+    fn consecutive_reverts_tracks_burst_and_resets_on_success() {
+        let mut history = ReconcileHistory::new();
+        assert_eq!(history.consecutive_reverts(), 0);
+
+        let rev = RevertEvent {
+            tx_hash: [1u8; 32],
+            block_number: 10,
+            reason: None,
+            gas_used: 50_000,
+            effective_gas_price: 20_000_000_000,
+        };
+
+        history.record_revert(rev.clone());
+        assert_eq!(history.consecutive_reverts(), 1);
+        history.record_revert(rev.clone());
+        assert_eq!(history.consecutive_reverts(), 2);
+
+        // Appending a confirmed pair must reset the consecutive revert counter
+        history.append(PredictedProfit(100), RealizedProfit(90));
+        assert_eq!(history.consecutive_reverts(), 0);
+
+        // A subsequent revert starts a new streak
+        history.record_revert(rev);
+        assert_eq!(history.consecutive_reverts(), 1);
+    }
+
+    #[test]
+    fn recent_revert_gas_burned_computes_cost() {
+        let mut history = ReconcileHistory::new();
+        let rev1 = RevertEvent {
+            tx_hash: [1u8; 32],
+            block_number: 10,
+            reason: None,
+            gas_used: 20_000,
+            effective_gas_price: 1_000, // 20,000,000
+        };
+        let rev2 = RevertEvent {
+            tx_hash: [2u8; 32],
+            block_number: 11,
+            reason: None,
+            gas_used: 30_000,
+            effective_gas_price: 2_000, // 60,000,000
+        };
+
+        history.record_revert(rev1);
+        history.append(PredictedProfit(100), RealizedProfit(90));
+        history.record_revert(rev2);
+
+        // Last 1 entry: rev2 only (60_000_000)
+        assert_eq!(history.recent_revert_gas_burned(1), 60_000_000);
+        // Last 3 entries: rev1 + rev2 = 80_000_000
+        assert_eq!(history.recent_revert_gas_burned(3), 80_000_000);
     }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "driftbrake_rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "High-performance Python bindings and vectorized backtesting engine for driftbrake."
+
+[lib]
+name = "driftbrake_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+driftbrake-core = { path = "../core", version = "0.2.0" }
+driftbrake-reconcile = { path = "../reconcile", version = "0.2.0" }
+driftbrake-journal = { path = "../journal", version = "0.2.0" }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }

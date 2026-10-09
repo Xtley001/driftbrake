@@ -8,6 +8,7 @@ homepage.workspace = true
 documentation.workspace = true
 description = "Chain-agnostic trait boundaries for driftbrake: ProfitDecoder, RealizedProfitDecoder, HaltPolicy, SimEngine. Zero dependency on REVM or alloy — see docs/ARCHITECTURE.md."
 keywords = ["ethereum", "evm", "mev", "simulation", "trading"]
+categories = ["cryptography::cryptocurrencies", "simulation"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

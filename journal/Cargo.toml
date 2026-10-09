@@ -1,0 +1,15 @@
+[package]
+name = "driftbrake-journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Crash-resilient binary Write-Ahead Log (WAL) persistence for ReconcileHistory in driftbrake."
+keywords = ["ethereum", "trading", "persistence", "wal", "risk-management"]
+categories = ["cryptography::cryptocurrencies", "asynchronous"]
+
+[dependencies]
+driftbrake-core = { path = "../core", version = "0.2.0" }
+thiserror = "1"

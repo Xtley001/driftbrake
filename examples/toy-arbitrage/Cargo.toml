@@ -1,6 +1,6 @@
 [package]
 name = "toy-arbitrage"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 description = "Minimal 2-pool arbitrage strategy wired end-to-end through driftbrake, against a public testnet fork. Illustrative, not production-hardened — see SECURITY.md."

@@ -77,6 +77,18 @@ pub struct RawSimOutput {
     pub logs: Vec<Log>,
 }
 
+/// A chronological event in the execution timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryEntry {
+    ConfirmedPair {
+        predicted: PredictedProfit,
+        realized: RealizedProfit,
+    },
+    RevertedTx {
+        event: RevertEvent,
+    },
+}
+
 /// A confirmed-but-reverted transaction, tracked separately from
 /// [`ReconcileHistory::pairs`] rather than folded in as a zero-profit
 /// realization (whitepaper Section 4.5).
@@ -85,16 +97,19 @@ pub struct RevertEvent {
     pub tx_hash: [u8; 32],
     pub block_number: u64,
     pub reason: Option<String>,
+    pub gas_used: u64,
+    pub effective_gas_price: u128,
 }
 
 /// Append-only, confirmation-time-ordered history of `(predicted,
-/// realized)` pairs.
+/// realized)` pairs and on-chain revert events.
 ///
 /// **Contract (`docs/API.md`):** `pairs` must be ordered by confirmation
 /// time, not submission time. A confirmed-but-reverted transaction is
-/// never appended to `pairs`; it is recorded in `reverts` instead.
+/// never appended to `pairs`; it is recorded in `reverts` and tracked in `timeline`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReconcileHistory {
+    pub timeline: VecDeque<HistoryEntry>,
     pub pairs: VecDeque<(PredictedProfit, RealizedProfit)>,
     pub reverts: Vec<RevertEvent>,
 }
@@ -112,13 +127,47 @@ impl ReconcileHistory {
     /// what happened), but [`Self::recent_ratios`] excludes them per
     /// whitepaper Property 4 (no silent zero-division).
     pub fn append(&mut self, predicted: PredictedProfit, realized: RealizedProfit) {
+        self.timeline.push_back(HistoryEntry::ConfirmedPair {
+            predicted,
+            realized,
+        });
         self.pairs.push_back((predicted, realized));
     }
 
     /// Record a confirmed-but-reverted transaction. Never enters `pairs`
     /// or the ratio computation (whitepaper Section 4.5).
     pub fn record_revert(&mut self, event: RevertEvent) {
+        self.timeline.push_back(HistoryEntry::RevertedTx {
+            event: event.clone(),
+        });
         self.reverts.push(event);
+    }
+
+    /// Returns the number of consecutive reverts at the tail of the timeline.
+    pub fn consecutive_reverts(&self) -> usize {
+        let mut count = 0;
+        for entry in self.timeline.iter().rev() {
+            match entry {
+                HistoryEntry::RevertedTx { .. } => count += 1,
+                HistoryEntry::ConfirmedPair { .. } => break,
+            }
+        }
+        count
+    }
+
+    /// Computes the total gas fee burned on reverts within the last `window` timeline entries.
+    pub fn recent_revert_gas_burned(&self, window: usize) -> u128 {
+        self.timeline
+            .iter()
+            .rev()
+            .take(window)
+            .filter_map(|entry| match entry {
+                HistoryEntry::RevertedTx { event } => {
+                    Some(event.gas_used as u128 * event.effective_gas_price)
+                }
+                HistoryEntry::ConfirmedPair { .. } => None,
+            })
+            .sum()
     }
 
     /// Ratios for the most recent `n` pairs, oldest first. Excludes any
@@ -146,7 +195,7 @@ impl ReconcileHistory {
 
 /// Structured reason a [`HaltDecision::Halt`] was returned.
 ///
-/// Deliberately structured rather than a bare string for the two built-in
+/// Deliberately structured rather than a bare string for the built-in
 /// guards — this is what lets `telemetry` emit a machine-readable event
 /// that the benchmark harness can aggregate without string parsing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,6 +208,29 @@ pub enum HaltReason {
         mean_ratio: f64,
         window_size: usize,
         threshold: f64,
+    },
+    /// Revert burst: k_rev consecutive transactions reverted on-chain.
+    RevertBurst {
+        consecutive_reverts: usize,
+        limit: usize,
+    },
+    /// Revert gas burn: cumulative gas cost on reverts in window exceeded budget.
+    RevertGasBudgetExceeded {
+        gas_cost_burned: u128,
+        budget_limit: u128,
+        window: usize,
+    },
+    /// Capital-weighted drift: volume-weighted ratio fell below threshold.
+    VolumeWeightedDrift {
+        weighted_ratio: f64,
+        threshold: f64,
+        window: usize,
+    },
+    /// Absolute drawdown: cumulative net slippage (predicted - realized) exceeded cap.
+    NetDrawdownExceeded {
+        net_slippage_loss: i128,
+        max_drawdown_limit: i128,
+        window: usize,
     },
     /// For non-default `HaltPolicy` implementations. Implementers of a
     /// reusable custom policy are encouraged to define their own

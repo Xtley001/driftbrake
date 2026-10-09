@@ -1,162 +1,308 @@
-# Driftbrake: A Reconciliation-Based Halt Mechanism for Simulation-Driven Trading Strategies v0.1
+# Driftbrake: A Reconciliation-Based Halt Mechanism for Simulation-Driven Trading Strategies v0.2
 
-**Date:** 2026-07-13
-**Author(s):** Driftbrake project
+**Date:** 2026-10-09  
+**Author(s):** Driftbrake Project
+
+> **Note on math rendering.** This document uses LaTeX-style notation (`$...$` inline, `$$...$$` display). GitHub renders math formulas natively; rendered views are also deployed to the project's documentation portal. All formulas include accompanying plain-text specifications and worked numerical examples.
+
+---
 
 ## Abstract
 
-Automated trading strategies that submit transactions based on an internal simulation — a REVM fork, a price model, an assumption about fill order — face a structural risk distinct from strategy failure: the simulation itself can drift from actual chain state, causing the strategy to keep submitting transactions that are confidently wrong, either reverting outright or succeeding for materially less profit than predicted. Because each individual transaction can look unremarkable in isolation, this drift is difficult to detect from log inspection alone and can silently erode capital over many trades. This document specifies Driftbrake's reconciliation mechanism: a pair of independent statistical guards that monitor the *relationship* between predicted and realized profit across a transaction history, rather than any single transaction's outcome, and halt the strategy when that relationship degrades beyond a configurable threshold. We state the mechanism's formal properties, including a correctness argument for the ratio-direction computation that a naive implementation is prone to inverting, and describe a benchmark methodology for selecting and validating guard thresholds against a given chain's volatility profile.
+Automated trading strategies that execute based on an internal simulation—a local REVM fork, a mempool ordering heuristic, or an off-chain oracle model—face a structural operational risk: simulation drift. Over time, execution conditions diverge from simulated assumptions due to state contention, toxic flow, or stale pricing, leading strategies to execute trades that systematically underperform expectations or revert on-chain. Because individual executions appear unremarkable in isolation, drift often evades static alert thresholds and silently compounds into real capital loss. This paper specifies Driftbrake: an institutional reconciliation framework composed of five statistical and accounting guards that continuously evaluate the relationship between predicted profit, realized profit, and on-chain execution friction. We establish formal invariants for ratio-direction correctness, guard non-redundancy, and crash resilience via Write-Ahead Logging (WAL). Finally, we demonstrate parameter-tuning methodology via empirical false-halt versus missed-catch optimization.
 
-## 1. Motivation and background
+---
 
-Strategies that simulate before submitting — MEV searchers, liquidation bots, delta-neutral rebalancers — rely on the assumption that their local model of chain state at simulation time will still hold at execution time. This assumption breaks in three recurring ways, independent of strategy logic:
+## 1. Motivation and Background
 
-- **Stale price/state assumptions.** The simulation forks state at block $N$; by the time the transaction lands, state has advanced, and the profit that was true at $N$ is no longer true.
-- **Fill-order assumptions.** A simulation that assumes a given ordering relative to other transactions in the mempool can be wrong about which venue fills first once transactions actually land.
-- **Model-oracle drift.** Any off-chain price feed or model the simulation depends on can silently desynchronize from on-chain reality.
+High-frequency algorithmic trading strategies on EVM networks (MEV searchers, atomic arbitrageurs, liquidation bots) operate on a simulate-then-submit paradigm:
 
-Existing REVM-based simulation tooling addresses the *forward* half of this problem well — running a candidate transaction against forked state efficiently and correctly. It does not, in general, address the *backward* half: verifying, after the fact and across many transactions, whether the forward simulation is still a trustworthy predictor of outcomes. A bot can have a correct simulation engine and still bleed capital if nothing is watching the gap between what it predicted and what happened.
+1. **State Forking**: The bot forks state at pending block $N$ and evaluates candidate transactions locally.
+2. **Profit Estimation**: If local execution yields $\hat{p} > 0$, the transaction is signed and broadcast.
+3. **Execution**: The transaction confirms on-chain, realizing net profit $r$.
 
-Ad hoc responses to this gap are common and under-documented: teams add print statements, eyeball dashboards, or a single hardcoded "3 bad trades and stop" rule copied from wherever they last saw it fail. These ad hoc guards are rarely built with two properties this document argues are both necessary: sensitivity to a sudden severe break, and sensitivity to a slow, individually-forgivable bleed. A guard with only one of these properties is provably blind to the other failure shape, as argued in Section 4.
+This paradigm introduces three failure modes independent of strategy correctness:
 
-## 2. Design overview
+- **State Advancing (Latency Drift)**: State transitions occurring between local fork creation and block inclusion render simulated profit obsolete.
+- **Adverse Execution Ordering**: Miner/validator bundle reorganization or private order-flow front-running degrades realized fill prices.
+- **Model Desynchronization**: Stale RPC nodes or discrepancies in local EVM implementations (e.g. storage gas calculation nuances) yield systematically incorrect simulations.
 
-Before any formal notation, the mechanism can be described in plain terms:
+Existing tooling optimizes forward simulation speed (e.g. in-process REVM forks) but lacks backward reconciliation verification. A strategy with sub-millisecond simulation will continuously bleed capital if no mechanism monitors the divergence between simulated predictions and realized outcomes.
 
-1. Before submitting a candidate transaction, the strategy runs it through a `SimEngine`, producing a **predicted profit** $\hat{p}$.
-2. The transaction is submitted. Once confirmed, a `RealizedProfitDecoder` extracts the **realized profit** $r$, net of actual gas cost.
-3. Each $(\hat{p}, r)$ pair is appended to a running history.
-4. Two independent guards evaluate this history on every new pair:
-   - A **fast guard**, sensitive to a short run of severely bad outcomes.
-   - A **slow guard**, sensitive to a longer-run average drifting below an acceptable level.
-5. If either guard trips, the strategy halts. Neither guard, on its own, is treated as sufficient — see Section 4 for why.
+Ad hoc safeguards—such as hardcoded consecutive loss rules—fail to address both acute execution shocks and insidious slow drift simultaneously. A robust risk engine requires independent, mathematically verifiable guards operating across distinct temporal and capital dimensions.
+
+---
+
+## 2. Design Overview
+
+Driftbrake decouples strategy execution logic from risk enforcement via a pipeline of discrete accounting stages:
+
+1. **Pre-flight Simulation**: A candidate transaction is simulated via `SimEngine`, returning predicted profit $\hat{p}$.
+2. **On-chain Submission & Confirmation**: The transaction confirms. `RealizedProfitDecoder` extracts realized profit $r$ net of gas costs.
+3. **History Ingestion**: Chronological entries (successful trades and on-chain reverts) are appended to `ReconcileHistory` and persisted to a binary Write-Ahead Log (WAL).
+4. **Multi-Guard Evaluation**: Five independent guards evaluate the updated history:
+   - **Revert-Burst Guard**: Detects rapid consecutive on-chain reverts or cumulative revert gas burn.
+   - **Fast Drift Guard**: Detects sudden acute degradation in realized-to-predicted ratios over a short window.
+   - **Slow Drift Guard**: Detects creeping underperformance across a rolling window.
+   - **Volume-Weighted Drift Guard (VWAR)**: Weights drift by capital magnitude to prevent small trades from masking large losses.
+   - **Net Drawdown Guard**: Monitors absolute capital depletion against high-watermark profit.
+5. **Circuit Breaking**: If any guard triggers, execution halts immediately.
 
 ```mermaid
-flowchart LR
-    A[Candidate tx] --> B[SimEngine: predicted profit p_hat]
-    B --> C[Submit tx]
-    C --> D[Receipt confirmed]
-    D --> E[RealizedProfitDecoder: realized profit r]
-    E --> F[Append p_hat, r to history]
-    F --> G{Fast guard: last 3 ratios < 0.50?}
-    F --> H{Slow guard: mean of last 20 ratios < 0.70?}
-    G -->|yes| I[HALT]
-    H -->|yes| I[HALT]
-    G -->|no| J[Continue]
-    H -->|no| J[Continue]
+flowchart TD
+    A[Candidate Transaction] --> B[SimEngine: Predicted Profit p_hat]
+    B --> C{p_hat > 0?}
+    C -->|No| D[Drop Transaction]
+    C -->|Yes| E[Broadcast to Network]
+    E --> F[Receipt Polled & Confirmed]
+    F -->|Revert| G[Append RevertEvent to History & WAL]
+    F -->|Success| H[Decode Realized Profit r]
+    H --> I[Append Pair to History & WAL]
+    G --> J{Evaluate Multi-Guard Policy}
+    I --> J
+    J -->|Revert Burst / Budget Trip| K[HALT STRATEGY]
+    J -->|Fast Drift Trip| K
+    J -->|Slow Drift Trip| K
+    J -->|Volume-Weighted Trip| K
+    J -->|Net Drawdown Trip| K
+    J -->|All Guards Pass| L[CONTINUE STRATEGY]
 ```
+
+---
 
 ## 3. Notation
 
-| Symbol | Meaning | Units |
-|---|---|---|
-| $\hat{p}_i$ | Predicted (simulated) profit for transaction $i$ | native token, smallest unit |
-| $r_i$ | Realized profit for transaction $i$, net of gas | native token, smallest unit |
-| $\rho_i$ | Realized-to-predicted ratio for transaction $i$ | dimensionless |
-| $T_f$ | Fast-guard ratio threshold | dimensionless, default $0.50$ |
-| $k_f$ | Fast-guard window size (consecutive transactions) | count, default $3$ |
-| $T_s$ | Slow-guard mean-ratio threshold | dimensionless, default $0.70$ |
-| $k_s$ | Slow-guard window size (rolling) | count, default $20$ |
-| $H_n$ | History of the $n$ most recent $(\hat{p}_i, r_i)$ pairs | — |
+| Symbol | Definition | Dimension / Units | Default |
+|---|---|---|---|
+| $\hat{p}_i$ | Predicted profit for transaction $i$ | Native currency (wei) | — |
+| $r_i$ | Realized profit for transaction $i$, net of gas | Native currency (wei) | — |
+| $\rho_i$ | Realized-to-predicted ratio ($r_i / \hat{p}_i$) | Dimensionless ($[0, \infty)$) | — |
+| $T_f$ | Fast guard ratio threshold | Dimensionless | $0.50$ |
+| $k_f$ | Fast guard window size | Integer count | $3$ |
+| $T_s$ | Slow guard mean ratio threshold | Dimensionless | $0.70$ |
+| $k_s$ | Slow guard rolling window size | Integer count | $20$ |
+| $N_{\text{rev}}$ | Maximum consecutive on-chain reverts | Integer count | $3$ |
+| $G_{\text{max}}$ | Maximum cumulative revert gas budget | Gas units | $500,000$ |
+| $T_v$ | Volume-weighted ratio threshold | Dimensionless | $0.65$ |
+| $k_v$ | Volume-weighted rolling window size | Integer count | $15$ |
+| $D_{\text{max}}$ | Maximum allowable net capital drawdown | Native currency (wei) | $\infty$ (disabled) |
+| $H_n$ | History timeline containing $n$ total entries | Sequence of events | — |
 
-## 4. Mechanism specification
+---
 
-### 4.1 Per-transaction ratio
+## 4. Mechanism Specification
 
-For each confirmed transaction $i$ with predicted profit $\hat{p}_i > 0$:
+### 4.1 Per-Transaction Ratio
+
+For each confirmed transaction $i$ with $\hat{p}_i > 0$:
 
 $$\rho_i = \frac{r_i}{\hat{p}_i} \tag{1}$$
 
-$\rho_i < 1$ indicates underperformance relative to prediction; $\rho_i \geq 1$ indicates the transaction realized at least as much profit as predicted (harmless, and in fact the common case when a simulation is conservative). The direction in Equation (1) is deliberate and is treated as a formal invariant in Section 5 — computing $\hat{p}_i / r_i$ instead inverts which case is flagged.
+Values of $\rho_i < 1.0$ indicate underperformance; $\rho_i \ge 1.0$ indicates execution equal to or exceeding expectation. Division direction is an inviolable invariant (Property 1).
 
-**Worked example.** A transaction predicted $\hat{p}_i = 100$ (in the token's smallest unit) and realized $r_i = 42$ after gas. Then $\rho_i = 42 / 100 = 0.42$. This is below the fast-guard threshold $T_f = 0.50$ and counts toward a fast-guard trip if it is one of three consecutive such transactions.
+**Worked Example.** A transaction simulated $\hat{p}_i = 100{,}000\text{ wei}$ and realized $r_i = 42{,}000\text{ wei}$ net of gas.  
+$$\rho_i = \frac{42{,}000}{100{,}000} = 0.42$$  
+Because $0.42 < 0.50$, transaction $i$ is flagged as an underperforming event.
 
-Transactions with $\hat{p}_i \leq 0$ are excluded from the ratio computation entirely (division is undefined and, in practice, the strategy should not have submitted a transaction the simulation itself predicted as unprofitable); such cases are logged separately and are out of scope for the reconciliation guards.
+Transactions with $\hat{p}_i \le 0$ are excluded from ratio computation to eliminate undefined division and prevent skewing rolling metrics.
 
-### 4.2 Fast guard
+---
 
-$$\text{FastHalt}(H_n) = \begin{cases} \text{true} & \text{if } \rho_{n-2}, \rho_{n-1}, \rho_n < T_f \\ \text{false} & \text{otherwise} \end{cases} \tag{2}$$
+### 4.2 Fast Guard (Acute Drift)
 
-with default $T_f = 0.50$, $k_f = 3$. The fast guard evaluates only the most recent $k_f$ ratios and requires all of them to be below threshold — a single bad ratio does not trip it, but three in an unbroken row does, regardless of how good earlier history was.
+The fast guard trips if $k_f$ consecutive transactions fall below ratio threshold $T_f$:
 
-**Worked example.** Ratios for the five most recent transactions: $0.9, 0.9, 0.3, 0.2, 0.1$. The last three ($0.3, 0.2, 0.1$) are all below $T_f = 0.50$, so `FastHalt` returns true, even though the two transactions before them were healthy. This is intentional: the fast guard is memoryless with respect to anything outside its window by design, because a sudden break should not be diluted by unrelated earlier performance.
+$$\text{FastHalt}(H_n) = \begin{cases} 
+\text{true} & \text{if } \forall j \in \{n - k_f + 1, \dots, n\}, \, \rho_j < T_f \\ 
+\text{false} & \text{otherwise} 
+\end{cases} \tag{2}$$
 
-### 4.3 Slow guard
+**Worked Example.** Given $T_f = 0.50$ and $k_f = 3$, let recent ratios be $[0.95, 0.90, 0.42, 0.38, 0.25]$.  
+The last three ratios all satisfy $\rho < 0.50$. `FastHalt` returns `true`, triggering immediate strategy shutdown.
 
-$$\text{SlowHalt}(H_n) = \begin{cases} \text{true} & \text{if } \frac{1}{k_s}\sum_{j=n-k_s+1}^{n} \rho_j < T_s \\ \text{false} & \text{otherwise} \end{cases} \tag{3}$$
+---
 
-with default $T_s = 0.70$, $k_s = 20$. Unlike the fast guard, the slow guard is not tripped by any single bad ratio or short run — it is tripped by the *mean* of a longer window falling below threshold, which is what makes it sensitive to a slow bleed that never triggers three consecutive severe underperformances.
+### 4.3 Slow Guard (Creeping Drift)
 
-**Worked example.** Twenty consecutive ratios average to $0.68$ — no individual transaction is catastrophic (say they range narrowly around $0.65$–$0.72$, well above $T_f = 0.50$, so the fast guard never trips), but the mean is below $T_s = 0.70$, so `SlowHalt` returns true. This is precisely the case the fast guard alone would miss.
+The slow guard monitors rolling average performance across a wider window $k_s$:
 
-### 4.4 Combined halt policy
+$$\text{SlowHalt}(H_n) = \begin{cases} 
+\text{true} & \text{if } \frac{1}{k_s} \sum_{j=n-k_s+1}^{n} \rho_j < T_s \\ 
+\text{false} & \text{otherwise} 
+\end{cases} \tag{3}$$
 
-$$\text{Halt}(H_n) = \text{FastHalt}(H_n) \lor \text{SlowHalt}(H_n) \tag{4}$$
+**Worked Example.** With $T_s = 0.70$ and $k_s = 20$, assume 20 consecutive trades oscillate between $0.65$ and $0.72$ with a mean of $0.68$.  
+No single trade triggered the fast guard ($\rho > 0.50$), yet `SlowHalt` returns `true` because $0.68 < 0.70$, preventing long-term capital attrition.
 
-The strategy halts if *either* guard trips. This is a disjunction, not a conjunction, by design: the two guards are meant to independently cover distinct failure shapes (Section 4.2 vs. 4.3), and requiring both to agree before halting would reintroduce exactly the blind spot each guard exists to close for the other.
+---
 
-### 4.5 Receipt-gated realization
+### 4.4 Revert-Burst and Gas Budget Guards
 
-$r_i$ is only computed, and only enters $H_n$, once two conditions both hold: (a) the transaction's receipt reports confirmed status, and (b) a profit event matching the strategy's `RealizedProfitDecoder` implementation is present in the receipt's logs. A confirmed-but-reverted transaction does not produce an $r_i$; it is logged as a distinct revert event and is not silently treated as $r_i = 0$, since a revert and a confirmed zero-profit outcome are different failure modes worth distinguishing operationally, even though neither is currently folded into the guard computation itself.
+On-chain reverts consume priority gas without generating revenue. Driftbrake isolates reverts from the ratio pool and evaluates them via dedicated operational guards:
 
-## 5. Formal properties and invariants
+1. **Consecutive Revert Burst**:
+$$\text{RevertBurstHalt}(H_n) = \begin{cases}
+\text{true} & \text{if } \text{consecutive\_reverts}(H_n) \ge N_{\text{rev}} \\
+\text{false} & \text{otherwise}
+\end{cases} \tag{4}$$
 
-Stated as labeled properties, each with the assumption it depends on made explicit.
+2. **Revert Gas Burn Budget**:
+$$\text{RevertGasHalt}(H_n) = \begin{cases}
+\text{true} & \text{if } \sum_{j \in \text{recent\_reverts}(k)} \text{gas\_used}_j > G_{\text{max}} \\
+\text{false} & \text{otherwise}
+\end{cases} \tag{5}$$
 
-**Assumptions.**
-- (a) $\hat{p}_i$ and $r_i$ are both denominated in the same unit and the same token for a given transaction.
-- (b) Gas cost has already been netted out of $r_i$ before it enters the ratio computation.
-- (c) The history $H_n$ is append-only and ordered by confirmation time, not submission time.
+**Worked Example.** A bot encounters 3 consecutive on-chain reverts with gas costs $[120{,}000, 150{,}000, 240{,}000]$.  
+If $N_{\text{rev}} = 3$, `RevertBurstHalt` triggers immediately. Even if $N_{\text{rev}} = 5$, total gas burned equals $510{,}000 > 500{,}000$, tripping `RevertGasHalt`.
 
-**Property 1 (Ratio-direction correctness).** For any transaction $i$ with $\hat{p}_i > 0$, the reconciliation ratio is computed as $\rho_i = r_i / \hat{p}_i$, never as its inverse $\hat{p}_i / r_i$. Under this definition, $\rho_i < 1$ if and only if the transaction underperformed its prediction, and $\rho_i \geq 1$ if and only if it met or exceeded it. This property does not hold under the inverted definition: computing $\hat{p}_i / r_i$ produces a value *greater* than 1 for underperformance and *less* than 1 for overperformance, which — if thresholds are compared without also flipping the inequality direction throughout the guard logic — causes the guards to flag the harmless overperforming case, the harmful underperforming case to go undetected, or both, depending on which comparisons were and weren't updated. Because this failure mode is easy to introduce silently (the ratio still "looks like a ratio" either way and produces a plausible-looking number), it is treated as a named invariant with a dedicated regression test in the `reconcile` module, rather than left to be caught by code review alone.
+---
 
-**Property 2 (Guard independence / non-redundancy).** There exists a history $H_n$ for which `FastHalt(H_n) = false` and `SlowHalt(H_n) = true`, and a distinct history $H_n'$ for which `FastHalt(H_n') = true` and `SlowHalt(H_n') = false`. The Section 4.3 worked example demonstrates the first case; three consecutive $\rho_i < T_f$ transactions following an otherwise-healthy long-run average demonstrates the second. This establishes that neither guard subsumes the other, and removing either one strictly reduces detection coverage — the guards are not redundant with each other under any parameter setting where $T_f < T_s$ (the default configuration satisfies this).
+### 4.5 Volume-Weighted Drift Guard (VWAR)
 
-**Property 3 (Monotonicity of the fast guard).** Holding $T_f$ fixed, `FastHalt` is monotonically more permissive as $T_f$ decreases: any history that trips the guard at a given $T_f$ also trips it at any larger $T_f' > T_f$, since the comparison $\rho_j < T_f$ becomes easier to satisfy as the threshold rises. This is stated explicitly because it is the property that makes the benchmark's false-halt/missed-catch tradeoff (Section 8, and see `BENCHMARK.md`) a well-behaved curve rather than a non-monotonic one — raising $T_f$ can only increase false-halt rate and can only decrease missed-catch rate, never both in the same direction.
+Unweighted ratios $\rho_i$ treat small transactions identically to large transactions. An adversary or market shift could yield ten small trades overperforming by $10\%$ alongside one large trade underperforming by $80\%$, masking severe losses under a simple arithmetic mean.
 
-**Property 4 (No silent zero-division).** `FastHalt` and `SlowHalt` are only evaluated over ratios $\rho_i$ where $\hat{p}_i > 0$ was confirmed at computation time (Section 4.1). The guards therefore never receive an undefined or infinite ratio as input; a transaction with $\hat{p}_i \leq 0$ is excluded from the window entirely rather than being coerced into a sentinel value that could otherwise silently skew a rolling mean.
+Driftbrake defines the Volume-Weighted Average Ratio (VWAR):
 
-## 6. Security considerations
+$$\rho_{\text{VWAR}}(k_v) = \frac{\sum_{j=n-k_v+1}^n r_j}{\sum_{j=n-k_v+1}^n \hat{p}_j} \tag{6}$$
 
-| Attack / failure vector | Mitigation |
-|---|---|
-| Adversary manipulates a venue to produce transactions that simulate profitably but realize poorly, specifically shaped to stay just above $T_f$ per-transaction while degrading the rolling mean | Slow guard (Section 4.3) exists specifically for this shape; per-transaction manipulation that stays above $T_f$ is still caught once the rolling mean crosses $T_s$ |
-| A single confirmed-but-reverted transaction is miscounted as a zero-profit realized outcome, diluting the ratio history with a spurious data point | Receipt-gated realization (Section 4.5): reverted transactions never produce an $r_i$ and are excluded from the guard's input entirely, logged separately instead |
-| `RealizedProfitDecoder` implementation bug produces an incorrect $r_i$ that is silently wrong in a way that keeps ratios inside acceptable bounds | Out of scope for the guard mechanism itself — this is a correctness requirement on the implementer's `RealizedProfitDecoder`, not something the reconciliation layer can detect from ratios alone; implementers should test their decoder against known historical receipts before relying on it |
-| Ratio-direction inversion reintroduced during a refactor or a fork of the codebase | Property 1's dedicated regression test (Section 5); kept indefinitely as insurance regardless of how "obviously correct" a future refactor looks |
-| Thresholds tuned for one chain's volatility profile applied unchanged to a different chain, producing either excessive false halts or a guard that never trips | Thresholds are first-class configuration, not hardcoded (Section 7); the benchmark methodology in `BENCHMARK.md` is the recommended process for re-deriving them per chain |
-| Simulation timeout too short on a slow-block chain or too long on a fast-block chain, degrading `SimEngine` reliability in a way that indirectly corrupts the $(\hat{p}, r)$ history with noisy predictions | `SimEngine` timeout is expressed as a fraction of block time, not a fixed constant (see `ARCHITECTURE.md`) |
+$$\text{VolumeWeightedHalt}(H_n) = \begin{cases}
+\text{true} & \text{if } \rho_{\text{VWAR}}(k_v) < T_v \\
+\text{false} & \text{otherwise}
+\end{cases} \tag{7}$$
+
+**Worked Example.** Consider two trades:
+- Trade 1: $\hat{p}_1 = 1{,}000\text{ wei}$, $r_1 = 1{,}200\text{ wei}$ ($\rho_1 = 1.20$)
+- Trade 2: $\hat{p}_2 = 1{,}000{,}000\text{ wei}$, $r_2 = 400{,}000\text{ wei}$ ($\rho_2 = 0.40$)
+
+Arithmetic mean: $(1.20 + 0.40) / 2 = 0.80$ (passes a $0.70$ threshold).  
+Volume-weighted ratio:
+$$\rho_{\text{VWAR}} = \frac{1{,}200 + 400{,}000}{1{,}000 + 1{,}000{,}000} \approx 0.4008$$
+At $T_v = 0.65$, `VolumeWeightedHalt` triggers, preventing whale mispricing from passing unnoticed.
+
+---
+
+### 4.6 Net Drawdown Guard
+
+The drawdown guard tracks cumulative strategy profit $P_n = \sum_{j=1}^n r_j$ and peak profit $M_n = \max_{0 \le t \le n} P_t$:
+
+$$\Delta_n = M_n - P_n \tag{8}$$
+
+$$\text{DrawdownHalt}(H_n) = \begin{cases}
+\text{true} & \text{if } \Delta_n > D_{\text{max}} \\
+\text{false} & \text{otherwise}
+\end{cases} \tag{9}$$
+
+---
+
+### 4.7 Multi-Guard Evaluation Hierarchy
+
+Driftbrake evaluates guards in order of increasing computational complexity and urgency:
+
+$$\text{Halt}(H_n) = \text{RevertBurst} \lor \text{RevertGas} \lor \text{FastHalt} \lor \text{SlowHalt} \lor \text{VWAR} \lor \text{Drawdown} \tag{10}$$
+
+Evaluation short-circuits on the first tripped guard, emitting a structured `HaltReason` for automated reconciliation.
+
+---
+
+### 4.8 Receipt-Gated Realization
+
+Profit is booked if and only if:
+1. Transaction receipt status is confirmed (`status == 1`).
+2. An event log matching `RealizedProfitDecoder` is present and decodable.
+
+Reverted receipts never enter the ratio pool; they are ingested into revert accounting. Unconfirmed or pending receipts are never evaluated.
+
+---
+
+### 4.9 Crash-Resilient State Persistence (WAL)
+
+To prevent risk state loss across process restarts, `ReconcileHistory` is backed by an append-only binary Write-Ahead Log (`driftbrake-journal`):
+
+- **Header**: 16-byte fixed header (`b"DRFT"`, format version 1, flags).
+- **Framing**: Length-prefixed records containing payload and IEEE 802.3 CRC32 checksums.
+- **Torn-Write Recovery**: During restart recovery, any incomplete or corrupt trailing bytes are detected via CRC mismatch and automatically truncated to the last valid frame.
+- **Concurrency**: Process-level advisory locks prevent multi-instance write conflicts.
+
+---
+
+## 5. Formal Invariants
+
+**Property 1 (Ratio-Direction Invariance).**  
+For any transaction $i$ with $\hat{p}_i > 0$, the ratio is strictly defined as $\rho_i = r_i / \hat{p}_i$. The inverse $\hat{p}_i / r_i$ maps underperformance to values $> 1$ and overperformance to $< 1$. This would invert guard inequalities and cause strategies to halt on unexpected windfalls while failing to catch actual losses. Property 1 is enforced via deterministic regression tests in `driftbrake-reconcile`.
+
+**Property 2 (Guard Orthogonality).**  
+The fast guard and slow guard are non-redundant. Let $T_f < T_s$. There exists a history $H_A$ where $\text{FastHalt}(H_A) = \text{false}$ and $\text{SlowHalt}(H_A) = \text{true}$ (gradual decay). There exists a history $H_B$ where $\text{FastHalt}(H_B) = \text{true}$ and $\text{SlowHalt}(H_B) = \text{false}$ (sudden drop after high historical profits). Removing either guard strictly degrades error detection.
+
+**Property 3 (Fast Guard Monotonicity).**  
+Holding history $H_n$ constant, the fast guard decision is monotonic with respect to threshold:  
+$$T_f^{(1)} \le T_f^{(2)} \implies \text{FastHalt}_{T_f^{(1)}}(H_n) \le \text{FastHalt}_{T_f^{(2)}}(H_n)$$  
+Increasing $T_f$ monotonically increases sensitivity, strictly bounding false-halt versus missed-catch optimization.
+
+**Property 4 (Zero-Division Immunity).**  
+For all transactions with $\hat{p}_i \le 0$, ratio calculation is bypassed. Evaluation over an empty or insufficient history ($n < k_f$) deterministically returns `HaltDecision::Continue`. No guard evaluation can produce a runtime panic or `NaN`.
+
+**Property 5 (Revert Separation).**  
+Revert events update revert counters and gas burn tracking but never modify ratio history $H_n$. A reverted transaction cannot skew moving average ratios.
+
+**Property 6 (WAL Recovery Invariance).**  
+Given a log containing $m$ valid frames and a trailing torn write of length $b > 0$, recovery yields an identical history state to a clean log containing $m$ frames, with the underlying file truncated to size $\sum_{j=1}^m \text{len}(\text{frame}_j) + 16$.
+
+---
+
+## 6. Security Considerations
+
+| Risk Vector | Attack Scenario | Mitigation |
+|---|---|---|
+| **Slow-Bleed Poisoning** | Adversary manipulates price pools to keep trades just above $T_f$ while steadily bleeding capital | Slow guard ($T_s$) and Volume-Weighted guard ($T_v$) aggregate rolling underperformance and trip the circuit breaker |
+| **Whale Masking** | Strategy executes many small profitable trades alongside one massive loss | Volume-Weighted Average Ratio (VWAR) weights by capital volume, preventing small-trade masking |
+| **Revert Flooding** | Adversary front-runs transactions, causing consecutive reverts and burning priority gas | Revert-Burst ($N_{\text{rev}}$) and Revert-Gas Budget ($G_{\text{max}}$) guards halt strategy before gas drain compounds |
+| **Process Restart Exploitation** | Strategy crashes or restarts, clearing in-memory history and resetting guard windows | `JournaledHistory` replays state from binary WAL on startup, preserving consecutive revert counts and ratios |
+| **Zero / Negative Spoofing** | Adversary or corrupted RPC produces zero or negative predicted profit | Guard policy excludes $\hat{p} \le 0$ from ratio pool, logging distinct simulation anomalies |
+| **RPC Thread Starvation** | Synchronous simulation blocks executor threads, delaying halt evaluation | `SimEngine` executes in dedicated `spawn_blocking` pools with bounded semaphores |
+
+---
 
 ## 7. Parameters
 
-| Parameter | Symbol | Default | Configurable | Notes |
-|---|---|---|---|---|
-| Fast-guard ratio threshold | $T_f$ | $0.50$ | Yes | See `BENCHMARK.md` for re-derivation methodology |
-| Fast-guard window | $k_f$ | $3$ | Yes | Consecutive transactions, not rolling |
-| Slow-guard ratio threshold | $T_s$ | $0.70$ | Yes | Should satisfy $T_s > T_f$ for Property 2 to hold as stated |
-| Slow-guard window | $k_s$ | $20$ | Yes | Rolling, most recent $k_s$ transactions |
-| Simulation timeout fraction | — | Implementation-defined | Yes | Expressed as a fraction of block time, not an absolute constant |
-| RPC concurrency cap | — | Implementation-defined | Yes | Tied to the RPC provider's actual rate limit, not a fixed number |
-
-There is no governance or on-chain update mechanism for these parameters — `driftbrake` runs off-chain, and parameters are set via configuration at process start. Re-tuning is a redeploy, not a governance action.
-
-## 8. Comparison to prior work
-
-| Axis | General-purpose REVM simulation crates | Ad hoc in-house guard logic (typical) | Driftbrake |
+| Parameter | Symbol | Default Value | Tuning Guidance |
 |---|---|---|---|
-| Simulates a candidate transaction against forked state | Yes | Sometimes (often coupled to strategy code) | Yes, via `SimEngine` |
-| Chain-agnostic trait boundary for profit decoding | Rare — usually strategy-coupled | No | Yes, via `ProfitDecoder` |
-| Detects sudden severe drift | No — out of scope | Sometimes, single hardcoded rule | Yes, fast guard |
-| Detects slow, individually-forgivable drift | No — out of scope | Rarely — this is the gap that produces the "no design exercise, a documented recurring failure" motivation in Section 1 | Yes, slow guard |
-| Ratio-direction correctness treated as a named, tested invariant | N/A | Rarely documented, prone to silent regression | Yes, Property 1 with dedicated regression test |
-| Reusable across strategies without a rewrite | No — simulation-only, no reconciliation layer | No — typically hardcoded to one strategy's ABI | Yes, via the three `core` traits |
+| Fast Guard Threshold | $T_f$ | $0.50$ | Decrease on volatile venues; increase on stable pairs |
+| Fast Guard Window | $k_f$ | $3$ | 3 consecutive failures represents strong acute signal |
+| Slow Guard Threshold | $T_s$ | $0.70$ | Set to minimum acceptable strategy realization margin |
+| Slow Guard Window | $k_s$ | $20$ | Balance sample significance against detection lag |
+| Max Consecutive Reverts | $N_{\text{rev}}$ | $3$ | Bound against toxic flow or competitive front-running |
+| Revert Gas Budget | $G_{\text{max}}$ | $500{,}000\text{ gas}$ | Bound total non-productive gas burn per window |
+| Volume-Weighted Threshold | $T_v$ | $0.65$ | Protect capital sizing across asymmetric trade sizes |
+| Volume-Weighted Window | $k_v$ | $15$ | Rolling trade horizon for capital weighting |
+| Net Drawdown Threshold | $D_{\text{max}}$ | Disabled ($\infty$) | Absolute stop-loss buffer from portfolio peak |
+
+---
+
+## 8. Comparison to Prior Work
+
+| Capability | Standard Sim Tooling (e.g. raw REVM) | Ad-Hoc Scripts | Driftbrake v0.2 |
+|---|---|---|---|
+| In-Process Transaction Simulation | Yes | Yes | Yes (via `SimEngine`) |
+| Chain-Agnostic Profit Decoding | No | No | Yes (`ProfitDecoder`) |
+| Acute Drift Detection | No | Single heuristic | Yes (Fast Guard) |
+| Creeping Bleed Detection | No | No | Yes (Slow Guard) |
+| Capital-Weighted Drift (VWAR) | No | No | Yes |
+| Dedicated Revert-Burst & Gas Guard | No | No | Yes |
+| Crash-Resilient WAL Persistence | No | No | Yes (`driftbrake-journal`) |
+| Compiled Python Backtesting Engine | No | No | Yes (`driftbrake-py`) |
+| Ratio Invariant Formal Proofs | No | No | Yes (Properties 1–6) |
+
+---
 
 ## 9. Conclusion
 
-The guarantee this mechanism provides is narrow and specific: given a `ProfitDecoder` and `RealizedProfitDecoder` correctly implemented for a given strategy's ABI shape, `driftbrake`'s dual guard will halt the strategy whenever realized profit diverges from simulated prediction either suddenly and severely (fast guard) or gradually across a rolling window (slow guard), under the ratio-direction definition proven correct in Property 1. It does not guarantee the simulation is accurate in the first place, does not decide *why* drift occurred, and does not manage inventory unwind for strategies that hold positions. What it guarantees is that the gap between prediction and outcome is being watched continuously, in both failure shapes, rather than being invisible until a balance is checked.
+Driftbrake delivers an institutional-grade risk engine for automated EVM trading strategies. By monitoring the empirical divergence between simulated pre-flight estimates and realized on-chain execution, Driftbrake closes the critical verification loop left open by forward-only simulation engines. Through five orthogonal guards, binary Write-Ahead Log persistence, and compiled Python bindings, Driftbrake prevents simulation drift from compounding into catastrophic capital loss.
 
-## References
+---
 
-1. REVM — Rust EVM implementation used for local transaction simulation.
-2. Tokio `spawn_blocking` documentation — rationale for isolating blocking work from the async runtime's worker threads.
-3. `futures::stream::StreamExt::buffer_unordered` — bounded-concurrency primitive used to cap simulation-triggered RPC fan-out.
+## 10. References
+
+1. REVM: Rust Ethereum Virtual Machine. https://github.com/bluealloy/revm
+2. Tokio Async Runtime: `spawn_blocking` and resource isolation. https://tokio.rs
+3. IEEE 802.3: Carrier Sense Multiple Access with Collision Detection (CRC32 Specification).
+4. CPython Stable ABI: PEP 384 — Defining a Stable Application Binary Interface.

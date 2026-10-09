@@ -1,0 +1,98 @@
+# driftbrake
+
+> Chain-agnostic pre-flight simulation and drift-based halt guard for simulation-driven trading strategies and MEV searchers in Rust.
+
+driftbrake is a modular Rust library that pre-flight simulates transactions (e.g. via REVM), tracks simulated versus realized profit upon on-chain confirmation, and triggers an automated halt policy ("phantom-guard") the moment realized profit drifts from prediction—preventing silent capital bleed.
+
+## Quick Facts
+- **Language**: Rust (Edition 2021)
+- **Repository**: https://github.com/Xtley001/driftbrake
+- **Documentation**: https://xtley001.github.io/driftbrake/
+- **API Reference**: https://docs.rs/driftbrake
+- **License**: MIT
+- **Crates & Packages**:
+  - `driftbrake`: Top-level Rust facade crate re-exporting core, reconcile, receipt-poller, and journal.
+  - `driftbrake-core`: Chain-agnostic trait boundaries (`ProfitDecoder`, `RealizedProfitDecoder`, `HaltPolicy`, `SimEngine`, `RevertEvent`).
+  - `driftbrake-reconcile`: The institutional halt policy mechanism (Fast/Slow drift guards, Revert-Burst guard, Volume-Weighted drift, and Net Drawdown).
+  - `driftbrake-journal`: Crash-resilient binary Write-Ahead Log (WAL) disk persistence for `ReconcileHistory` with CRC32 integrity verification.
+  - `driftbrake-receipt-poller`: Block-time-aware transaction receipt confirmation and profit decoding.
+  - `driftbrake-revm-backend`: REVM fork-and-simulate engine with thread-safe `spawn_blocking` and bounded RPC concurrency.
+  - `driftbrake-py`: Official Python native extension (`pip install driftbrake`) with PyO3 bindings and vectorized backtesting sweeps.
+  - `driftbrake-benchmark`: Synthetic simulation drift generator and false-halt vs missed-catch benchmark sweep.
+
+## Core Concepts & Problem Solved
+1. **Simulation Drift**: In high-frequency EVM trading (MEV, arbitrage, liquidations), local state forks drift from real chain state due to stale RPC state, race conditions, or adverse execution.
+2. **Silent Capital Bleed**: Bots often continue executing trades when individual logs appear successful but net realized profit is negative or decaying.
+3. **Institutional Multi-Guard Hierarchy**:
+   - **Revert-Burst Guard**: Halts immediately on `N` consecutive on-chain reverts or cumulative revert gas burn cap exceeded.
+   - **Fast Guard (`T_f`, `k_f`)**: Detects acute failure modes (e.g., ratio of realized to predicted below threshold over a short window).
+   - **Slow Guard (`T_s`, `k_s`)**: Detects insidious slow bleed (gradual underperformance over a longer window).
+   - **Volume-Weighted Drift (VWAR)**: Weights drift by transaction capital volume, preventing high-volume miscalculations from being masked by low-volume trades.
+   - **Net Drawdown Guard**: Halts if cumulative strategy profit drops below a peak watermark threshold.
+4. **Persistent State (WAL)**: `JournaledHistory` records append operations to an append-only binary log on disk with CRC32 checksums, protecting against state loss across bot crashes.
+5. **Non-Blocking Architecture**: Wraps synchronous REVM simulation inside `tokio::task::spawn_blocking` to prevent starving the async event loop.
+6. **Vectorized Python Research**: Run parameter sweeps over millions of trade entries in sub-second time via compiled Rust bindings.
+
+## Installation
+```toml
+# Rust (Cargo.toml)
+[dependencies]
+driftbrake = "0.2"
+# Optional concrete REVM simulation backend:
+driftbrake-revm-backend = "0.2"
+```
+
+```bash
+# Python (pip)
+pip install driftbrake
+```
+
+## Minimal Example (Rust)
+```rust
+use driftbrake::{
+    PredictedProfit, RealizedProfit, ReconcileHistory, ReconcilePolicy, HaltDecision,
+};
+
+let mut guard = ReconcilePolicy::institutional_default();
+let mut history = ReconcileHistory::new();
+
+// Record predicted profit from pre-flight simulation vs actual on-chain receipt profit
+history.append(PredictedProfit(1_000_000), RealizedProfit(950_000));
+
+match guard.evaluate(&history) {
+    HaltDecision::Continue => {
+        // Safe to proceed with trading strategy
+    }
+    HaltDecision::Halt(reason) => {
+        // Immediately halt bot execution before capital bleed compounds
+        eprintln!("Drift detected, strategy halted: {:?}", reason);
+    }
+}
+```
+
+## Minimal Example (Python)
+```python
+from driftbrake import ReconcileHistory, ReconcilePolicy, StrategyHaltedError
+
+policy = ReconcilePolicy(
+    fast_window=3, fast_threshold=0.50,
+    slow_window=20, slow_threshold=0.70,
+    max_consecutive_reverts=3
+)
+history = ReconcileHistory()
+
+# Add pre-flight predicted vs realized profit pairs
+history.append(predicted_profit=1_000_000, realized_profit=950_000)
+
+# Enforce policy in live trading loop
+decision = policy.evaluate(history)
+if decision.is_halted:
+    raise StrategyHaltedError(decision.reason)
+```
+
+## Documentation Links
+- [Book & Whitepaper](https://xtley001.github.io/driftbrake/)
+- [Architecture Deep Dive](https://xtley001.github.io/driftbrake/ARCHITECTURE.html)
+- [API Reference](https://docs.rs/driftbrake)
+- [Crates.io Package](https://crates.io/crates/driftbrake)
+- [PyPI Package](https://pypi.org/project/driftbrake/)

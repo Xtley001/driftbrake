@@ -8,6 +8,7 @@ homepage.workspace = true
 documentation.workspace = true
 description = "The default HaltPolicy: the dual-guard reconciliation mechanism ('phantom-guard') — fast guard + slow guard. See docs/whitepaper.md."
 keywords = ["ethereum", "trading", "risk-management", "mev", "simulation"]
+categories = ["cryptography::cryptocurrencies", "simulation"]
 
 [dependencies]
-driftbrake-core = { path = "../core", version = "0.1.0" }
+driftbrake-core = { path = "../core", version = "0.2.0" }

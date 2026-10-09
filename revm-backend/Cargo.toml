@@ -8,9 +8,10 @@ homepage.workspace = true
 documentation.workspace = true
 description = "Concrete SimEngine implementation: REVM fork-and-simulate, spawn_blocking, bounded concurrency, block-time-relative timeout. See docs/ARCHITECTURE.md."
 keywords = ["ethereum", "evm", "revm", "simulation", "mev"]
+categories = ["cryptography::cryptocurrencies", "simulation", "asynchronous"]
 
 [dependencies]
-driftbrake-core = { path = "../core", version = "0.1.0" }
+driftbrake-core = { path = "../core", version = "0.2.0" }
 revm = { version = "=3.5.0", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 async-trait = "0.1"

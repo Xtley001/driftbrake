@@ -7,6 +7,7 @@ on:
       - "docs/**"
       - "theme/**"
       - "book.toml"
+      - "llms.txt"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -33,7 +34,9 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build the book
-        run: mdbook build
+        run: |
+          mdbook build
+          cp llms.txt book/llms.txt
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

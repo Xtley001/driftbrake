@@ -1,43 +1,60 @@
-# Phantom Profit: Three Bugs That Will Cost You Real Money, and the Guard That Catches Them
+# Phantom Profit: Three Production Simulation Bugs
 
-This is a write-up of three bugs, not a pitch for a library. All three showed up independently in a live trading bot's simulate-then-submit pipeline, and none of them are specific to the strategy, the chain, or the ABI they were first found in. If you're running anything that simulates a transaction before submitting it — a searcher bot, a liquidation bot, a delta-neutral rebalancer — there's a good chance you either have these bugs right now, or you'll hit them the first time you run live for long enough. We're documenting them here in detail, separately from the project's [whitepaper](./whitepaper.md), because this is a different kind of writing: less proof, more "here's exactly what went wrong and what it looked like from the outside."
+This document details three structural failure modes observed in production simulate-then-submit trading systems. Unlike application-level logic errors, these issues manifest as silent capital decay while individual transaction logs appear nominally successful.
 
-## The setup
+## Pipeline Architecture
 
-The shape of the pipeline is common enough that you'll recognize it even if your specifics differ: fork chain state, simulate a candidate transaction through REVM, check if it's profitable, submit if so, wait for confirmation, move on. The failure mode that motivated all of this isn't any single bad trade — it's that a bot's internal model of the world can quietly go stale relative to actual chain state, and every individual log line along the way still looks fine. You don't see a crash. You see a bot that keeps confidently doing the thing it always does, while slowly doing it worse.
+Algorithmic execution loops (MEV searchers, atomic arbitrageurs, liquidators) follow a four-stage lifecycle:
+1. **Fork State**: Replicate current blockchain state via local EVM or JSON-RPC.
+2. **Pre-flight Simulate**: Execute candidate transactions against forked state to verify profitability.
+3. **Broadcast**: Submit profitable transactions to block builders or public mempools.
+4. **Confirm**: Ingest transaction receipts upon block inclusion.
 
-## Bug 1: the ratio, backwards
+When execution conditions change between simulation and inclusion, this lifecycle produces simulation drift.
 
-This is the one that's the most embarrassing in retrospect, because it's genuinely a one-character-class of bug and it still slipped through.
+## Failure Mode 1: Backward Ratio Calculation
 
-The reconciliation logic compares realized profit against simulated profit. The natural way to express "did this trade perform as expected" is `realized / simulated` — a value below 1 means you got less than predicted, a value at or above 1 means you got at least as much. That's the correct direction.
+Reconciliation evaluates realized profit against simulated expectation. The natural formulation is:
 
-At one point during development, this got flipped to `simulated / realized`. It reads almost the same. It still produces a number that looks like a ratio. And if you don't also flip every comparison and every threshold check downstream of it, here's what happens: the case where a trade did *better* than predicted — genuinely harmless, arguably the point of the whole exercise — gets flagged as a problem, because the inverted ratio comes out greater than 1 in exactly the case where the guard is checking for values *below* a threshold to flag underperformance. Meanwhile the case you actually care about, real underperformance, can silently fail to cross the check in the direction the (now-inverted) logic is looking, and the guard that exists specifically to catch it doesn't.
+$$\rho = \frac{\text{realized}}{\text{predicted}}$$
 
-The lesson isn't "be careful with division direction," which is true but not useful on its own. The lesson is that this class of bug produces a *plausible-looking* output at every step. Nothing crashes. Nothing throws. You get numbers, they look like ratios, and unless you have a test that pins down which direction is correct and asserts it explicitly, a refactor six months later can reintroduce this with zero symptoms until someone eventually reconciles account balances against expected performance and can't explain the gap. We kept this as a permanent regression test, not because we expect to make the same mistake twice in the same place, but because the *class* of mistake — a metric that silently means the opposite of what you think it means — is cheap to reintroduce and expensive to notice.
+Values $\rho < 1.0$ indicate underperformance; values $\rho \ge 1.0$ indicate performance meeting or exceeding prediction.
 
-## Bug 2: starving your own event loop
+Inverting this formula yields:
 
-This one is about async Rust specifically, but the underlying lesson generalizes past Rust: mixing blocking work into an async runtime doesn't fail loudly, it fails as degraded throughput that's hard to attribute to a cause.
+$$\rho_{\text{inv}} = \frac{\text{predicted}}{\text{realized}}$$
 
-REVM execution and synchronous RPC calls are blocking work — they occupy a thread for a meaningful stretch of wall-clock time without yielding. Call them directly from inside an `async fn` running on a multiplexed runtime like tokio's, and you're not just slowing down that one simulation — you're occupying a worker thread that the runtime expected to be free to service *other* tasks, including the main block-processing loop that's supposed to be picking up the next block's opportunities. The bot doesn't crash. It just gets progressively slower at reacting to new blocks, in a way that's genuinely hard to see from the outside unless you're specifically instrumenting time-from-block-seen to time-to-simulation-started.
+Under inversion, underperformance yields $\rho_{\text{inv}} > 1.0$, while profitable outperformance yields $\rho_{\text{inv}} < 1.0$. If downstream guards evaluate `ratio < threshold` without inverting comparison operators, two catastrophic conditions occur:
+- Profitable trades that exceeded simulation are incorrectly flagged as anomalies.
+- Trades that severely underperformed pass through without triggering circuit breakers.
 
-The fix is mechanical once you know to look for it — wrap blocking calls in `tokio::task::spawn_blocking`, which moves them onto a dedicated thread pool and leaves the async worker threads free. What's worth internalizing is the detection difficulty: this bug looks like "the bot seems a bit slow sometimes" long before it looks like anything you'd call a bug. If your simulation pipeline wraps a synchronous library — and REVM's core simulation call, or most JSON-RPC client calls, often are synchronous under the hood even if you're calling them from async code — check for this specifically. It reproduces identically whether your target chain has 400ms blocks or 12-second blocks, because it's a thread-starvation problem, not a timing problem.
+Because both formulas output positive floating-point numbers, inversion produces plausible log outputs that bypass casual inspection. Driftbrake enforces ratio direction as an invariant protected by automated regression tests.
 
-## Bug 3: fast simulation, slow because of concurrency
+## Failure Mode 2: Worker-Thread Starvation
 
-The third bug only shows up at scale, which is exactly why it's easy to miss in testing and only bites in production.
+In asynchronous Rust runtimes (e.g. Tokio), CPU-bound operations executed inside async functions block the underlying worker thread.
 
-A single block can surface dozens of candidate opportunities worth simulating. The obvious way to simulate all of them quickly is to fire them all off concurrently — `join_all` across every candidate, let them all run in parallel, take whichever come back profitable. This works fine in local testing against a handful of opportunities. It falls apart against a real RPC provider once you're hitting 50+ simulations in the same window, because unbounded concurrent RPC calls saturate the provider's rate limit, and what should have been a fast local simulation turns into a slow, throttled one — during exactly the moments (busy, opportunity-rich blocks) when speed matters most.
+Both in-process REVM execution and synchronous JSON-RPC calls occupy CPU threads for multiple milliseconds. Executing these routines directly within an `async fn` prevents the worker thread from yielding to concurrent tasks. This starves the main block-listener loop, increasing latency between block observation and candidate transaction submission.
 
-The fix is bounded concurrency — something like `buffer_unordered(N)` instead of `join_all`, with `N` tied to what your specific RPC provider can actually sustain, not a number picked once in testing and forgotten. The generalizable lesson: any time your local testing environment has meaningfully lower request volume than production will, "works fine in dev" tells you almost nothing about whether you've bounded your concurrency correctly. This bug is invisible until the exact conditions — high candidate volume, real provider rate limits — that make it matter.
+### Remediation
+Wrap CPU-intensive simulation routines in `tokio::task::spawn_blocking`. This offloads heavy computation to a dedicated thread pool, preserving asynchronous runtime throughput.
 
-## What actually catches this class of failure
+## Failure Mode 3: RPC Provider Rate-Limit Saturation
 
-None of these three bugs, once fixed, prevent the underlying problem this whole pipeline exists to guard against: a simulation that's *correct in its own logic* but has drifted from actual chain reality, for reasons that have nothing to do with any of the three bugs above (a stale price feed, a fill-order assumption that stopped holding, a venue behaving differently than modeled). Fixing bugs 1–3 makes the pipeline mechanically sound. It doesn't make the simulation's *predictions* trustworthy over time.
+A volatile block can yield 50 or more simultaneous trading candidates. Attempting to simulate all candidates concurrently via unbounded futures (`join_all`) causes immediate request bursts.
 
-That's the actual reason for a reconciliation guard: something that watches the relationship between what you predicted and what actually happened, across many trades, and stops the strategy when that relationship breaks down — not when a single trade goes wrong (that's normal, expected variance), but when the pattern across recent trades says the model itself can no longer be trusted. We built this as two independent checks rather than one, because a single check is blind to one of two distinct failure shapes: a fast, severe break (three bad trades in a row — something acute just broke) needs a different detector than a slow, individually-forgivable bleed (twenty trades that each look "fine enough" on their own but average out to real underperformance). A guard built to catch the first is structurally incapable of catching the second, and vice versa — this isn't a tuning problem, it's a coverage gap that only closes by having both.
+External RPC providers enforce aggressive rate limits. Unbounded concurrency triggers HTTP 429 throttling during high-opportunity blocks—precisely when execution speed is most critical.
 
-## If you're building one of these
+### Remediation
+Enforce bounded concurrency via provider-calibrated semaphores (e.g. `buffer_unordered(N)`). Bounding concurrent requests to provider limits eliminates throttling while maintaining maximum sustainable throughput.
 
-The pattern worth naming and recognizing, independent of whether you use anything we built: if your bot simulates before it submits, ask whether anything in your system is watching the *relationship* between prediction and outcome over time, not just whether any individual transaction succeeded. Log lines that look fine one at a time can still add up to a strategy that's quietly bleeding. The three bugs above are specific and mechanical enough that you can go check your own codebase for them directly. The reconciliation gap is more structural — it's less "do you have this bug" and more "does anything in your system even have the job of noticing this class of problem at all."
+## Multi-Guard Reconciliation
+
+Resolving execution bugs ensures mechanical reliability but does not prevent market-driven simulation drift. Price oracle delays, mempool bundle competition, and execution slippage require automated reconciliation:
+
+- **Acute Shocks**: Handled via the Fast Guard ($k_f$ consecutive underperformances).
+- **Creeping Decay**: Handled via the Slow Guard (rolling mean across $k_s$ transactions).
+- **Asymmetric Capital Sizing**: Handled via Volume-Weighted Drift (VWAR).
+- **Toxic Flow & Front-Running**: Handled via Revert-Burst and Revert-Gas Budget guards.
+
+Continuously evaluating the gap between predicted and realized profit guarantees that operational divergence is intercepted before capital bleed compounds.

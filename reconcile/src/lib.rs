@@ -68,42 +68,73 @@ impl Default for SlowGuardConfig {
     }
 }
 
-/// The default `HaltPolicy`: the phantom-guard dual guard.
+/// Revert-burst configuration: halts if `limit` consecutive transactions revert on-chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevertBurstConfig {
+    pub limit: usize,
+}
+
+impl Default for RevertBurstConfig {
+    fn default() -> Self {
+        Self { limit: 3 }
+    }
+}
+
+/// Revert gas-budget configuration: halts if cumulative gas fees burned on reverts
+/// within the last `window` timeline entries exceeds `budget_limit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevertGasConfig {
+    pub budget_limit: u128,
+    pub window: usize,
+}
+
+/// Volume-weighted average ratio configuration: halts if VWAR of the last `window`
+/// confirmed pairs drops below `threshold`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeWeightedConfig {
+    pub threshold: f64,
+    pub window: usize,
+}
+
+impl Default for VolumeWeightedConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 0.75,
+            window: 20,
+        }
+    }
+}
+
+/// Absolute net capital drawdown configuration: halts if cumulative prediction deficit
+/// (sum(predicted - realized)) across the last `window` pairs exceeds `max_drawdown_limit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawdownConfig {
+    pub max_drawdown_limit: i128,
+    pub window: usize,
+}
+
+/// The default `HaltPolicy`: the phantom-guard dual guard, optionally extended
+/// with revert and capital-weighted risk guards.
 ///
 /// Construct via [`ReconcilePolicy::default_dual_guard`] for the
-/// whitepaper's default thresholds, or [`ReconcilePolicy::new`] for
-/// custom ones (see `docs/BENCHMARK.md` for the re-derivation
-/// methodology).
-///
-/// **Statelessness note:** this policy keeps no fields beyond its static
-/// configuration — every `evaluate` call recomputes ratios fresh from
-/// `history`. This isn't just an implementation choice: `core`'s
-/// `HaltPolicy` contract requires that any internal state be derivable
-/// from `history` alone, precisely so a policy can be replayed against
-/// historical data for the benchmark sweep. Keeping no derived state at
-/// all trivially satisfies that.
+/// whitepaper's default thresholds, [`ReconcilePolicy::institutional_default`]
+/// for revert-burst and volume-weighted protections, or [`ReconcilePolicy::new`]
+/// for custom parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReconcilePolicy {
     fast: FastGuardConfig,
     slow: SlowGuardConfig,
+    revert_burst: Option<RevertBurstConfig>,
+    revert_gas: Option<RevertGasConfig>,
+    volume_weighted: Option<VolumeWeightedConfig>,
+    drawdown: Option<DrawdownConfig>,
 }
 
 impl ReconcilePolicy {
     /// Build a policy with explicit guard configuration.
     ///
     /// Per whitepaper Property 2, `slow.threshold` should be greater than
-    /// `fast.threshold` for the two guards to be non-redundant as stated;
-    /// this is checked with a `debug_assert` (a warning to a developer
-    /// running tests, not a hard runtime requirement — a team may have a
-    /// deliberate reason to deviate, at their own risk).
-    ///
-    /// A `window` of `0` is rejected outright (not just via
-    /// `debug_assert`): `recent_ratios(0)` always returns an empty `Vec`,
-    /// and "all ratios in an empty window are below threshold" is
-    /// vacuously true — a `window: 0` guard halts unconditionally on the
-    /// very first `evaluate` call, even against a completely empty
-    /// history, which is never the intended behavior for a threshold
-    /// window.
+    /// `fast.threshold` for the two guards to be non-redundant as stated.
     ///
     /// # Panics
     /// Panics if `fast.window == 0` or `slow.window == 0`.
@@ -123,7 +154,42 @@ impl ReconcilePolicy {
             slow.threshold,
             fast.threshold
         );
-        Self { fast, slow }
+        Self {
+            fast,
+            slow,
+            revert_burst: None,
+            revert_gas: None,
+            volume_weighted: None,
+            drawdown: None,
+        }
+    }
+
+    /// Enable consecutive revert burst detection.
+    pub fn with_revert_burst(mut self, config: RevertBurstConfig) -> Self {
+        assert!(config.limit > 0, "revert-burst limit must be > 0");
+        self.revert_burst = Some(config);
+        self
+    }
+
+    /// Enable cumulative revert gas budget monitoring.
+    pub fn with_revert_gas(mut self, config: RevertGasConfig) -> Self {
+        assert!(config.window > 0, "revert-gas window must be > 0");
+        self.revert_gas = Some(config);
+        self
+    }
+
+    /// Enable volume-weighted average ratio (VWAR) reconciliation.
+    pub fn with_volume_weighted(mut self, config: VolumeWeightedConfig) -> Self {
+        assert!(config.window > 0, "volume-weighted window must be > 0");
+        self.volume_weighted = Some(config);
+        self
+    }
+
+    /// Enable net capital slippage drawdown monitoring.
+    pub fn with_drawdown(mut self, config: DrawdownConfig) -> Self {
+        assert!(config.window > 0, "drawdown window must be > 0");
+        self.drawdown = Some(config);
+        self
     }
 
     /// The whitepaper's default configuration: `T_f = 0.50`, `k_f = 3`,
@@ -132,12 +198,36 @@ impl ReconcilePolicy {
         Self::new(FastGuardConfig::default(), SlowGuardConfig::default())
     }
 
+    /// Institutional multi-guard policy enabling revert-burst ($k_{rev}=3$)
+    /// and volume-weighted ratio ($T_{vw}=0.75, k_{vw}=20$) protections.
+    pub fn institutional_default() -> Self {
+        Self::default_dual_guard()
+            .with_revert_burst(RevertBurstConfig::default())
+            .with_volume_weighted(VolumeWeightedConfig::default())
+    }
+
     pub fn fast_guard_config(&self) -> FastGuardConfig {
         self.fast
     }
 
     pub fn slow_guard_config(&self) -> SlowGuardConfig {
         self.slow
+    }
+
+    pub fn revert_burst_config(&self) -> Option<RevertBurstConfig> {
+        self.revert_burst
+    }
+
+    pub fn revert_gas_config(&self) -> Option<RevertGasConfig> {
+        self.revert_gas
+    }
+
+    pub fn volume_weighted_config(&self) -> Option<VolumeWeightedConfig> {
+        self.volume_weighted
+    }
+
+    pub fn drawdown_config(&self) -> Option<DrawdownConfig> {
+        self.drawdown
     }
 }
 
@@ -149,10 +239,31 @@ impl Default for ReconcilePolicy {
 
 impl HaltPolicy for ReconcilePolicy {
     fn evaluate(&mut self, history: &ReconcileHistory) -> HaltDecision {
-        // Fast guard (whitepaper Section 4.2, Equation 2): halt on `k_f`
-        // consecutive ratios all below `T_f`. Requires a *full* window —
-        // per `core`'s HaltPolicy contract, a short history must not
-        // panic or be treated as if it satisfied the guard.
+        // 1. Revert burst check (immediate infrastructure failure)
+        if let Some(burst) = self.revert_burst {
+            let consecutive = history.consecutive_reverts();
+            if consecutive >= burst.limit {
+                return HaltDecision::Halt(HaltReason::RevertBurst {
+                    consecutive_reverts: consecutive,
+                    limit: burst.limit,
+                });
+            }
+        }
+
+        // 2. Revert gas budget check
+        if let Some(gas_cfg) = self.revert_gas {
+            let burned = history.recent_revert_gas_burned(gas_cfg.window);
+            if burned > gas_cfg.budget_limit {
+                return HaltDecision::Halt(HaltReason::RevertGasBudgetExceeded {
+                    gas_cost_burned: burned,
+                    budget_limit: gas_cfg.budget_limit,
+                    window: gas_cfg.window,
+                });
+            }
+        }
+
+        // 3. Fast guard (whitepaper Section 4.2, Equation 2): halt on `k_f`
+        // consecutive ratios all below `T_f`.
         let fast_window = history.recent_ratios(self.fast.window);
         if fast_window.len() == self.fast.window
             && fast_window.iter().all(|ratio| *ratio < self.fast.threshold)
@@ -163,7 +274,55 @@ impl HaltPolicy for ReconcilePolicy {
             });
         }
 
-        // Slow guard (whitepaper Section 4.3, Equation 3): halt if the
+        // 4. Absolute net capital drawdown check
+        if let Some(dd_cfg) = self.drawdown {
+            let pairs_in_window = history
+                .pairs
+                .iter()
+                .rev()
+                .take(dd_cfg.window)
+                .collect::<Vec<_>>();
+            if pairs_in_window.len() == dd_cfg.window {
+                let net_slippage_loss: i128 = pairs_in_window
+                    .iter()
+                    .map(|(p, r)| p.0 - r.0)
+                    .sum();
+                if net_slippage_loss > dd_cfg.max_drawdown_limit {
+                    return HaltDecision::Halt(HaltReason::NetDrawdownExceeded {
+                        net_slippage_loss,
+                        max_drawdown_limit: dd_cfg.max_drawdown_limit,
+                        window: dd_cfg.window,
+                    });
+                }
+            }
+        }
+
+        // 5. Volume-weighted average ratio check
+        if let Some(vw_cfg) = self.volume_weighted {
+            let valid_pairs = history
+                .pairs
+                .iter()
+                .rev()
+                .filter(|(p, _)| p.0 > 0)
+                .take(vw_cfg.window)
+                .collect::<Vec<_>>();
+            if valid_pairs.len() == vw_cfg.window {
+                let total_predicted: i128 = valid_pairs.iter().map(|(p, _)| p.0).sum();
+                let total_realized: i128 = valid_pairs.iter().map(|(_, r)| r.0).sum();
+                if total_predicted > 0 {
+                    let weighted_ratio = total_realized as f64 / total_predicted as f64;
+                    if weighted_ratio < vw_cfg.threshold {
+                        return HaltDecision::Halt(HaltReason::VolumeWeightedDrift {
+                            weighted_ratio,
+                            threshold: vw_cfg.threshold,
+                            window: vw_cfg.window,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 6. Slow guard (whitepaper Section 4.3, Equation 3): halt if the
         // mean of the last `k_s` ratios drops below `T_s`.
         let slow_window = history.recent_ratios(self.slow.window);
         if slow_window.len() == self.slow.window {
@@ -447,5 +606,174 @@ mod tests {
             policy.evaluate(&history),
             HaltDecision::Halt(HaltReason::FastGuard { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // New Institutional Multi-Guard Tests (v0.2.0)
+    // -----------------------------------------------------------------
+    #[test]
+    fn revert_burst_trips_on_consecutive_reverts() {
+        let mut policy = ReconcilePolicy::default_dual_guard()
+            .with_revert_burst(RevertBurstConfig { limit: 3 });
+        let mut history = ReconcileHistory::new();
+
+        // 10 healthy pairs
+        for _ in 0..10 {
+            history.append(PredictedProfit(100), RealizedProfit(100));
+        }
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+
+        let rev = driftbrake_core::RevertEvent {
+            tx_hash: [0u8; 32],
+            block_number: 1,
+            reason: None,
+            gas_used: 21_000,
+            effective_gas_price: 30_000_000_000,
+        };
+
+        history.record_revert(rev.clone());
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+        history.record_revert(rev.clone());
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+        history.record_revert(rev);
+
+        assert_eq!(
+            policy.evaluate(&history),
+            HaltDecision::Halt(HaltReason::RevertBurst {
+                consecutive_reverts: 3,
+                limit: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn confirmed_pair_resets_revert_burst_counter() {
+        let mut policy = ReconcilePolicy::default_dual_guard()
+            .with_revert_burst(RevertBurstConfig { limit: 3 });
+        let mut history = ReconcileHistory::new();
+
+        let rev = driftbrake_core::RevertEvent {
+            tx_hash: [0u8; 32],
+            block_number: 1,
+            reason: None,
+            gas_used: 21_000,
+            effective_gas_price: 30_000_000_000,
+        };
+
+        // 2 reverts, then 1 confirmed trade, then 2 reverts: never reaches limit of 3
+        history.record_revert(rev.clone());
+        history.record_revert(rev.clone());
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+
+        history.append(PredictedProfit(100), RealizedProfit(100));
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+
+        history.record_revert(rev.clone());
+        history.record_revert(rev);
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+    }
+
+    #[test]
+    fn revert_gas_budget_trips_when_burned_gas_exceeds_limit() {
+        let mut policy = ReconcilePolicy::default_dual_guard()
+            .with_revert_gas(RevertGasConfig {
+                budget_limit: 100_000_000,
+                window: 5,
+            });
+        let mut history = ReconcileHistory::new();
+
+        let rev = driftbrake_core::RevertEvent {
+            tx_hash: [0u8; 32],
+            block_number: 1,
+            reason: None,
+            gas_used: 50_000,
+            effective_gas_price: 1_000, // 50,000,000 cost
+        };
+
+        history.record_revert(rev.clone());
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+
+        // Second revert burns another 50,000,000 => total 100,000,000 (not exceeded yet)
+        history.record_revert(rev.clone());
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+
+        // Third revert pushes total to 150,000,000 > 100,000,000 limit
+        history.record_revert(rev);
+        assert!(matches!(
+            policy.evaluate(&history),
+            HaltDecision::Halt(HaltReason::RevertGasBudgetExceeded {
+                gas_cost_burned: 150_000_000,
+                budget_limit: 100_000_000,
+                window: 5,
+            })
+        ));
+    }
+
+    #[test]
+    fn volume_weighted_guard_trips_on_whale_collapse_even_if_small_trades_win() {
+        // Asymmetric capital vulnerability: 19 small wins + 1 giant loss
+        let mut policy = ReconcilePolicy::default_dual_guard()
+            .with_volume_weighted(VolumeWeightedConfig {
+                threshold: 0.75,
+                window: 20,
+            });
+        let mut history = ReconcileHistory::new();
+
+        // 19 small trades: predicted $10, realized $12 (ratio 1.20)
+        for _ in 0..19 {
+            history.append(PredictedProfit(10), RealizedProfit(12));
+        }
+
+        // 1 large whale trade: predicted $100,000, realized $40,000 (ratio 0.40)
+        history.append(PredictedProfit(100_000), RealizedProfit(40_000));
+
+        // Unweighted mean ratio = (19 * 1.2 + 0.4) / 20 = 1.16 => Slow guard thinks it's great!
+        // But volume-weighted ratio = (19*12 + 40,000) / (19*10 + 100,000) = 40,228 / 100,190 ~ 0.4015
+        match policy.evaluate(&history) {
+            HaltDecision::Halt(HaltReason::VolumeWeightedDrift {
+                weighted_ratio,
+                threshold,
+                window,
+            }) => {
+                assert!(weighted_ratio < 0.41);
+                assert_eq!(threshold, 0.75);
+                assert_eq!(window, 20);
+            }
+            other => panic!("expected VolumeWeightedDrift halt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drawdown_guard_trips_on_absolute_capital_deficit() {
+        let mut policy = ReconcilePolicy::default_dual_guard()
+            .with_drawdown(DrawdownConfig {
+                max_drawdown_limit: 50_000,
+                window: 3,
+            });
+        let mut history = ReconcileHistory::new();
+
+        // 3 trades where slippage gap is 20,000 each => total 60,000 > 50,000 limit
+        history.append(PredictedProfit(100_000), RealizedProfit(80_000));
+        history.append(PredictedProfit(100_000), RealizedProfit(80_000));
+        assert_eq!(policy.evaluate(&history), HaltDecision::Continue);
+
+        history.append(PredictedProfit(100_000), RealizedProfit(80_000));
+        assert_eq!(
+            policy.evaluate(&history),
+            HaltDecision::Halt(HaltReason::NetDrawdownExceeded {
+                net_slippage_loss: 60_000,
+                max_drawdown_limit: 50_000,
+                window: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn institutional_default_enables_revert_and_volume_weighted_guards() {
+        let policy = ReconcilePolicy::institutional_default();
+        assert!(policy.revert_burst_config().is_some());
+        assert!(policy.volume_weighted_config().is_some());
+        assert_eq!(policy.revert_burst_config().unwrap().limit, 3);
+        assert_eq!(policy.volume_weighted_config().unwrap().threshold, 0.75);
     }
 }
